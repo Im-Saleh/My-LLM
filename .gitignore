@@ -1,0 +1,20 @@
+# build outputs
+build/
+build-*/
+dist/
+cmake-build*/
+
+# run artefacts
+run/
+runs/
+*.slm
+*.slmtok
+*.jsonl
+data/*.txt
+!data/.gitkeep
+
+# editors / os
+.vscode/
+.idea/
+*.swp
+.DS_Store
