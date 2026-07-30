@@ -13,6 +13,9 @@ runs/
 !models/*.slm
 !models/*.slmtok
 data/*.txt
+data/raw/
+data/tokens/
+data/synth/
 !data/.gitkeep
 
 # editors / os

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <sstream>
 #include <stdexcept>
 
@@ -26,6 +27,7 @@ uint64_t name_seed(const std::string& n, uint64_t base) {
 // Everything one block needs.  Undefined tensors mean "this architecture does
 // not have that parameter" (no biases with RMSNorm/SwiGLU, for example).
 struct BlockWeights {
+  Tensor qn, kn;                // optional QK-norm gains (per head dim)
   Tensor n1g, n1b;              // attention norm
   Tensor qkvw, qkvb;            // fused q,k,v projection
   Tensor pw, pb;                // attention output projection
@@ -44,6 +46,7 @@ struct BlockShape {
   NormKind norm = NormKind::kRMSNorm;
   PosKind pos = PosKind::kRoPE;
   FFNKind ffn = FFNKind::kSwiGLU;
+  bool qk_norm = true;
 };
 
 Tensor apply_norm(const Tensor& x, const Tensor& g, const Tensor& b, NormKind kind,
@@ -88,6 +91,10 @@ Tensor block_forward(const BlockWeights& w, const Tensor& x, const BlockShape& s
   Tensor k = qkv.slice(2, C, C + KV).reshape({B, Tq, Hkv, Dh}).transpose(1, 2);
   Tensor v = qkv.slice(2, C + KV, C + 2 * KV).reshape({B, Tq, Hkv, Dh}).transpose(1, 2);
 
+  if (s.qk_norm && w.qn.defined()) {
+    q = q.rmsnorm(w.qn, s.eps);
+    k = k.rmsnorm(w.kn, s.eps);
+  }
   if (s.pos == PosKind::kRoPE) {
     q = rope(q, s.pos_offset, s.rope_theta);
     k = rope(k, s.pos_offset, s.rope_theta);
@@ -161,6 +168,7 @@ int64_t GPTConfig::param_count() const {
   if (pos == PosKind::kLearned) n += block_size * C;
   const int64_t norm_params = (norm == NormKind::kRMSNorm) ? C : 2 * C;
   int64_t per_block = 2 * norm_params;
+  if (qk_norm) per_block += 2 * Dh;                 // q/k norm gains
   per_block += C * (C + 2 * KV);                    // qkv
   per_block += C * C;                               // attention out
   if (linear_bias) per_block += (C + 2 * KV) + C;
@@ -178,7 +186,8 @@ int64_t GPTConfig::param_count() const {
 
 std::string GPTConfig::arch_summary() const {
   std::ostringstream os;
-  os << (norm == NormKind::kRMSNorm ? "rmsnorm" : "layernorm") << "+"
+  os << (qk_norm ? "qknorm+" : "")
+     << (norm == NormKind::kRMSNorm ? "rmsnorm" : "layernorm") << "+"
      << (pos == PosKind::kRoPE ? "rope" : "learned-pos") << "+"
      << (ffn == FFNKind::kSwiGLU ? "swiglu" : "gelu-mlp");
   if (kv_heads() != n_head) os << "+gqa" << n_head << ":" << kv_heads();
@@ -220,6 +229,7 @@ GPTConfig GPTConfig::from_config(const Config& c) {
     g.pos = PosKind::kLearned;
     g.ffn = FFNKind::kGeluMLP;
     g.linear_bias = true;
+    g.qk_norm = false;
   }
   g.vocab_size = static_cast<int32_t>(c.get_int("model.vocab_size", g.vocab_size));
   g.n_layer = c.get_int("model.n_layer", g.n_layer);
@@ -233,6 +243,7 @@ GPTConfig GPTConfig::from_config(const Config& c) {
   g.init_std = static_cast<float>(c.get_num("model.init_std", g.init_std));
   g.ln_eps = static_cast<float>(c.get_num("model.ln_eps", g.ln_eps));
   g.rope_theta = static_cast<float>(c.get_num("model.rope_theta", g.rope_theta));
+  g.qk_norm = c.get_bool("model.qk_norm", g.qk_norm);
   const std::string norm = c.get_str("model.norm", g.norm == NormKind::kRMSNorm ? "rms" : "layer");
   g.norm = (norm == "layer" || norm == "layernorm") ? NormKind::kLayerNorm : NormKind::kRMSNorm;
   const std::string pos = c.get_str("model.pos", g.pos == PosKind::kRoPE ? "rope" : "learned");
@@ -261,6 +272,7 @@ void GPTConfig::write_to(Config& c) const {
   c.set("model.ffn", ffn == FFNKind::kSwiGLU ? "swiglu" : "gelu");
   c.set("model.linear_bias", linear_bias ? "true" : "false");
   c.set("model.rope_theta", std::to_string(rope_theta));
+  c.set("model.qk_norm", qk_norm ? "true" : "false");
 }
 
 std::string FreezePolicy::describe() const {
@@ -306,6 +318,10 @@ GPT::GPT(const GPTConfig& cfg) : cfg_(cfg) {
     if (!rms) register_param(p + "n1.b", {C});
     register_param(p + "attn.qkv.w", {C, C + 2 * KV});
     if (cfg_.linear_bias) register_param(p + "attn.qkv.b", {C + 2 * KV});
+    if (cfg_.qk_norm) {
+      register_param(p + "attn.qnorm.g", {cfg_.head_dim()});
+      register_param(p + "attn.knorm.g", {cfg_.head_dim()});
+    }
     register_param(p + "attn.proj.w", {C, C});
     if (cfg_.linear_bias) register_param(p + "attn.proj.b", {C});
     register_param(p + "n2.g", {C});
@@ -379,6 +395,61 @@ void GPT::init_weights(uint64_t seed) {
   recompute_trainable();
 }
 
+GPT::GrowthEvent GPT::grow_depth(int64_t new_blocks, int64_t step) {
+  GrowthEvent ev;
+  ev.step = step;
+  ev.layers_before = cfg_.n_layer;
+  ev.params_before = num_params();
+  const bool rms = cfg_.norm == NormKind::kRMSNorm;
+  for (int64_t k = 0; k < new_blocks; ++k) {
+    const std::string src = block_prefix(cfg_.n_layer - 1);
+    const std::string dst = block_prefix(cfg_.n_layer);
+    std::vector<std::string> suffixes = {"n1.g", "attn.qkv.w", "attn.proj.w", "n2.g"};
+    if (!rms) {
+      suffixes.push_back("n1.b");
+      suffixes.push_back("n2.b");
+    }
+    if (cfg_.qk_norm) {
+      suffixes.push_back("attn.qnorm.g");
+      suffixes.push_back("attn.knorm.g");
+    }
+    if (cfg_.linear_bias) {
+      suffixes.push_back("attn.qkv.b");
+      suffixes.push_back("attn.proj.b");
+    }
+    if (cfg_.ffn == FFNKind::kSwiGLU) {
+      suffixes.push_back("mlp.gate.w");
+      suffixes.push_back("mlp.up.w");
+      suffixes.push_back("mlp.down.w");
+    } else {
+      suffixes.push_back("mlp.up.w");
+      suffixes.push_back("mlp.down.w");
+      if (cfg_.linear_bias) {
+        suffixes.push_back("mlp.up.b");
+        suffixes.push_back("mlp.down.b");
+      }
+    }
+    for (const std::string& suf : suffixes) {
+      const Tensor& from = params_.at(src + suf);
+      std::vector<float> data;
+      from.copy_to_host(data);
+      // The two residual output projections start at zero so that the fresh
+      // block computes exactly identity: growth does not disturb the loss.
+      if (suf == "attn.proj.w" || suf == "mlp.down.w" || suf == "attn.proj.b" ||
+          suf == "mlp.down.b")
+        std::fill(data.begin(), data.end(), 0.0f);
+      params_.emplace(dst + suf, Tensor::from_host(from.shape(), data.data(), true));
+      order_.push_back(dst + suf);
+    }
+    ++cfg_.n_layer;
+  }
+  recompute_trainable();
+  ev.layers_after = cfg_.n_layer;
+  ev.params_after = num_params();
+  growth_.push_back(ev);
+  return ev;
+}
+
 void GPT::set_freeze_policy(const FreezePolicy& p) {
   policy_ = p;
   recompute_trainable();
@@ -429,6 +500,19 @@ ParamStorePtr GPT::snapshot() const {
 }
 
 void GPT::load_params(const ParamStore& s) {
+  // Guard against silently dropping weights: a checkpoint that carries more
+  // parameters than this model has (for instance after progressive growth) is a
+  // configuration mistake, not something to ignore.
+  if (s.names.size() > order_.size()) {
+    size_t missing = 0;
+    for (const std::string& n : s.names)
+      if (params_.find(n) == params_.end()) ++missing;
+    if (missing)
+      std::fprintf(stderr,
+                   "warning: checkpoint has %zu parameters this model does not "
+                   "(architecture mismatch: %zu vs %zu tensors)\n",
+                   missing, s.names.size(), order_.size());
+  }
   for (const std::string& n : order_) {
     const int i = s.find(n);
     if (i < 0) throw std::runtime_error("load_params: missing parameter " + n);
@@ -463,6 +547,7 @@ Tensor GPT::forward(const std::vector<int32_t>& ids, int64_t B, int64_t T,
   shape.norm = cfg_.norm;
   shape.pos = cfg_.pos;
   shape.ffn = cfg_.ffn;
+  shape.qk_norm = cfg_.qk_norm;
 
   Tensor x = embedding(params_.at("tok_emb"), ids, B, T);
   if (cfg_.pos == PosKind::kLearned) {
@@ -481,6 +566,10 @@ Tensor GPT::forward(const std::vector<int32_t>& ids, int64_t B, int64_t T,
     if (!rms) w.n1b = params_.at(p + "n1.b");
     w.qkvw = params_.at(p + "attn.qkv.w");
     if (cfg_.linear_bias) w.qkvb = params_.at(p + "attn.qkv.b");
+    if (cfg_.qk_norm) {
+      w.qn = params_.at(p + "attn.qnorm.g");
+      w.kn = params_.at(p + "attn.knorm.g");
+    }
     w.pw = params_.at(p + "attn.proj.w");
     if (cfg_.linear_bias) w.pb = params_.at(p + "attn.proj.b");
     w.n2g = params_.at(p + "n2.g");

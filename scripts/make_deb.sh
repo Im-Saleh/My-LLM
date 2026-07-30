@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
-VERSION="0.2.0"
+VERSION="0.3.0"
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64) ARCH=amd64 ;;
@@ -51,6 +51,10 @@ install -m 0755 "$BIN" "$STAGE/usr/bin/slm"
 install -m 0644 "$ROOT"/configs/*.conf "$STAGE/usr/share/$PKG/configs/"
 install -m 0755 "$ROOT"/scripts/make_sample_data.py "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/fetch_data.sh "$STAGE/usr/share/$PKG/scripts/"
+install -m 0755 "$ROOT"/scripts/fetch_data.py "$STAGE/usr/share/$PKG/scripts/"
+install -m 0755 "$ROOT"/scripts/make_trilingual_data.py "$STAGE/usr/share/$PKG/scripts/"
+install -m 0755 "$ROOT"/scripts/update_data.sh "$STAGE/usr/share/$PKG/scripts/"
+install -m 0755 "$ROOT"/scripts/train_stages.sh "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/quickstart.sh "$STAGE/usr/share/$PKG/scripts/"
 install -m 0644 "$ROOT"/README.md "$STAGE/usr/share/doc/$PKG/"
 install -m 0644 "$ROOT"/docs/*.md "$STAGE/usr/share/doc/$PKG/"

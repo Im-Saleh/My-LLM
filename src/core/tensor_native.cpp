@@ -1157,6 +1157,48 @@ Tensor repeat_kv(const Tensor& x, int64_t repeat) {
   return Tensor(out);
 }
 
+Tensor z_loss(const Tensor& logits) {
+  const ImplPtr li = logits.impl();
+  SLM_CHECK(li && !li->shape.empty(), "z_loss: bad logits");
+  const int64_t V = li->shape.back();
+  const int64_t N = li->n / V;
+  auto lse = std::make_shared<std::vector<float>>(static_cast<size_t>(N), 0.0f);
+  const float* x = li->data();
+  double acc = 0.0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) reduction(+ : acc) if (!omp_in_parallel() && N > 32)
+#endif
+  for (int64_t r = 0; r < N; ++r) {
+    const float* xr = x + r * V;
+    float mx = xr[0];
+    for (int64_t j = 1; j < V; ++j) mx = std::max(mx, xr[j]);
+    float s = 0.0f;
+    for (int64_t j = 0; j < V; ++j) s += std::exp(xr[j] - mx);
+    const float l = mx + std::log(s);
+    (*lse)[static_cast<size_t>(r)] = l;
+    acc += static_cast<double>(l) * l;
+  }
+  auto out = make_impl({});
+  out->data()[0] = static_cast<float>(acc / static_cast<double>(std::max<int64_t>(1, N)));
+  if (t_grad_enabled && li->requires_grad) {
+    link(out, {li}, "z_loss", [li, lse, N, V](TensorImpl& o) {
+      const float g = o.gconst()[0] * 2.0f / static_cast<float>(std::max<int64_t>(1, N));
+      const float* x2 = li->data();
+      float* gr = li->g();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && N > 32)
+#endif
+      for (int64_t r = 0; r < N; ++r) {
+        const float l = (*lse)[static_cast<size_t>(r)];
+        const float* xr = x2 + r * V;
+        float* g2 = gr + r * V;
+        for (int64_t j = 0; j < V; ++j) g2[j] += g * l * std::exp(xr[j] - l);
+      }
+    });
+  }
+  return Tensor(out);
+}
+
 // =========================================================================
 // Gradient checkpointing
 // =========================================================================
@@ -1256,6 +1298,7 @@ void backend_init(int threads, bool prefer_cuda) {
   gemm_set_num_threads(threads);
 }
 bool backend_on_gpu() { return false; }
+int backend_threads() { return gemm_num_threads(); }
 size_t backend_allocated_bytes() {
   return g_alloc_bytes.load(std::memory_order_relaxed);
 }

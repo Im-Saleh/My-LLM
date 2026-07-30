@@ -374,20 +374,26 @@ TextStats analyse(const std::string& text) {
     if (nl == std::string::npos) break;
     line_start = nl + 1;
   }
-  st.code_signals += indented + 2 * colon_eol;
+  // Keyword hits alone are a bad signal: English prose is full of "for ", "if "
+  // and "class ".  Real code is *structural*: indented lines and lines that end
+  // in a colon.  The keyword count only modulates that.
+  st.struct_lines = indented + colon_eol;
+  st.struct_ratio =
+      static_cast<double>(st.struct_lines) / std::max<double>(1.0, static_cast<double>(st.lines));
   const double denom = std::max<double>(1.0, static_cast<double>(st.chars));
   st.arabic_ratio = static_cast<double>(st.arabic) / denom;
   st.latin_ratio = static_cast<double>(st.latin) / denom;
-  st.code_score = std::min(
-      1.0, static_cast<double>(st.code_signals) /
-               std::max(1.0, static_cast<double>(st.lines) * 0.8 + 2.0));
+  const double kw_density =
+      static_cast<double>(st.code_signals) / std::max(1.0, static_cast<double>(st.lines));
+  st.code_score = std::min(1.0, st.struct_ratio * (0.6 + 0.4 * std::min(1.0, kw_density)));
   return st;
 }
 
 Lang detect_language(const TextStats& st) {
   if (st.chars == 0) return Lang::kUnknown;
   if (st.arabic_ratio > 0.15) return Lang::kPersian;
-  if (st.code_score > 0.55) return Lang::kPython;
+  // Code needs *structure*, not just keywords.
+  if (st.struct_ratio > 0.18 && st.code_score > 0.15) return Lang::kPython;
   if (st.latin_ratio > 0.20) return Lang::kEnglish;
   return Lang::kUnknown;
 }

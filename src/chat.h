@@ -20,6 +20,7 @@
 #include "core/rng.h"
 #include "coordinator.h"
 #include "interaction.h"
+#include "memory.h"
 #include "model.h"
 #include "telemetry.h"
 #include "tokenizer.h"
@@ -40,6 +41,16 @@ class ChatEngine {
  public:
   ChatEngine(const GPTConfig& mcfg, Coordinator* coord, Telemetry* tel,
              InteractionHub* hub, const Tokenizer* tok, const GenOptions& go);
+
+  // Optional long-term memory: relevant entries are retrieved and injected as a
+  // <|system|> block before every turn (no training needed), and can later be
+  // consolidated into the weights by the continual thread.
+  void set_memory(MemoryStore* mem, int top_k = 3) {
+    mem_ = mem;
+    mem_k_ = top_k;
+  }
+  MemoryStore* memory() const { return mem_; }
+  std::string last_memory_block() const;
   ~ChatEngine();
 
   void start();
@@ -74,6 +85,9 @@ class ChatEngine {
   std::vector<ChatTurn> history_;
   std::string partial_;
 
+  MemoryStore* mem_ = nullptr;
+  int mem_k_ = 3;
+  std::string last_mem_;
   std::thread th_;
   std::atomic<bool> run_{false};
   std::atomic<bool> busy_{false};

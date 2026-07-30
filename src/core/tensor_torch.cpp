@@ -329,6 +329,12 @@ Tensor logsigmoid(const Tensor& x) {
   return Tensor(wrap(torch::log_sigmoid(raw(x))));
 }
 
+Tensor z_loss(const Tensor& logits) {
+  const torch::Tensor& l = raw(logits);
+  const int64_t V = l.size(-1);
+  return Tensor(wrap(l.reshape({-1, V}).logsumexp(-1).pow(2).mean()));
+}
+
 Tensor rope(const Tensor& x, int64_t pos_offset, float theta) {
   const torch::Tensor& t = raw(x);
   SLM_CHECK(t.dim() == 4, "rope: expected [B,H,T,D]");
@@ -426,6 +432,7 @@ void backend_init(int threads, bool prefer_cuda) {
 }
 
 bool backend_on_gpu() { return g_device.is_cuda(); }
+int backend_threads() { return at::get_num_threads(); }
 size_t backend_allocated_bytes() { return 0; }
 
 }  // namespace slm

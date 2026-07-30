@@ -40,8 +40,13 @@ size_t AdamW::state_bytes() const {
   return n;
 }
 
-float AdamW::step(float lr_override) {
+float AdamW::step(float lr_override, float skip_above, bool* skipped) {
   const float norm = grads_global_norm(params_);
+  if (skipped) *skipped = false;
+  if (skip_above > 0.0f && norm > skip_above) {
+    if (skipped) *skipped = true;
+    return norm;  // one bad batch never reaches the weights
+  }
   if (cfg_.grad_clip > 0.0f && norm > cfg_.grad_clip && norm > 0.0f)
     grads_scale(params_, cfg_.grad_clip / norm);
   ++t_;
@@ -52,6 +57,20 @@ float AdamW::step(float lr_override) {
                 cfg_.weight_decay * decay_[i], t_);
   }
   return norm;
+}
+
+float lr_schedule_wsd(int64_t step, float base_lr, int64_t warmup, int64_t total,
+                      float decay_frac, float min_ratio) {
+  if (step < warmup && warmup > 0)
+    return base_lr * static_cast<float>(step + 1) / static_cast<float>(warmup);
+  const int64_t decay_steps =
+      std::max<int64_t>(1, static_cast<int64_t>(static_cast<double>(total) * decay_frac));
+  const int64_t decay_start = std::max<int64_t>(warmup, total - decay_steps);
+  if (step < decay_start) return base_lr;
+  const float p = static_cast<float>(step - decay_start) / static_cast<float>(decay_steps);
+  const float t = std::min(1.0f, std::max(0.0f, p));
+  // 1-sqrt decay: spends more time at a useful LR than a linear ramp
+  return base_lr * std::max(min_ratio, 1.0f - std::sqrt(t));
 }
 
 float lr_schedule(int64_t step, float base_lr, int64_t warmup, int64_t total,

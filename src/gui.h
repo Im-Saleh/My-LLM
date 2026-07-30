@@ -19,6 +19,7 @@
 #include "chat.h"
 #include "coordinator.h"
 #include "interaction.h"
+#include "memory.h"
 #include "telemetry.h"
 #include "tokenizer.h"
 #include "trainer.h"
@@ -35,7 +36,12 @@ struct DashboardContext {
   const AppOptions* opt = nullptr;
   const GPTConfig* mcfg = nullptr;
   std::atomic<bool>* quit = nullptr;
+  MemoryStore* memory = nullptr;
 };
+
+// Pushes up to `n` memories into the continual-learning buffer so they end up in
+// the weights instead of only in the prompt.
+int teach_memories(DashboardContext& ctx, size_t n);
 
 int run_terminal_dashboard(DashboardContext& ctx);
 int run_imgui_dashboard(DashboardContext& ctx);

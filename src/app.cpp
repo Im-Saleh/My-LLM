@@ -30,6 +30,7 @@
 #include "core/serialize.h"
 #include "gui.h"
 #include "interaction.h"
+#include "memory.h"
 #include "telemetry.h"
 #include "tokenizer.h"
 #include "train_continual.h"
@@ -38,6 +39,12 @@
 
 namespace slm {
 namespace {
+
+std::vector<int32_t> span_tokens(const TokenStore& t, int64_t a, int64_t b) {
+  std::vector<int32_t> out;
+  for (int64_t i = a; i < b; ++i) out.push_back(t.at(static_cast<size_t>(i)));
+  return out;
+}
 
 TrainerConfig trainer_defaults(const Config& c, const char* prefix, float lr,
                                int64_t local_steps, double interval, int replay,
@@ -73,21 +80,21 @@ class Autopilot {
     // Mine question/answer pairs from *every* source, so the synthetic user
     // rates Persian, English and Python in turn instead of biasing one language.
     for (int si = 0; si < ds->num_sources(); ++si) {
-      const std::vector<int32_t>& t = ds->data(si).tokens();
+      const TokenStore& t = ds->data(si).tokens();
       const int64_t limit = ds->data(si).train_tokens();
       size_t added = 0;
       for (int64_t i = 0; i < limit && added < 256; ++i) {
-        if (t[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
+        if (t.at(static_cast<size_t>(i)) != Tokenizer::kUser) continue;
         int64_t a = i + 1;
-        while (a < limit && t[static_cast<size_t>(a)] != Tokenizer::kAssistant && a - i < 48) ++a;
-        if (a >= limit || t[static_cast<size_t>(a)] != Tokenizer::kAssistant) continue;
+        while (a < limit && t.at(static_cast<size_t>(a)) != Tokenizer::kAssistant && a - i < 48) ++a;
+        if (a >= limit || t.at(static_cast<size_t>(a)) != Tokenizer::kAssistant) continue;
         int64_t e = a + 1;
-        while (e < limit && t[static_cast<size_t>(e)] != Tokenizer::kEot && e - a < 96) ++e;
+        while (e < limit && t.at(static_cast<size_t>(e)) != Tokenizer::kEot && e - a < 96) ++e;
         if (e >= limit) break;
         QA qa;
         qa.lang = ds->info(si).lang;
-        qa.question = tok_->decode(std::vector<int32_t>(t.begin() + i + 1, t.begin() + a));
-        qa.answer = tok_->decode(std::vector<int32_t>(t.begin() + a + 1, t.begin() + e));
+        qa.question = tok_->decode(span_tokens(t, i + 1, a));
+        qa.answer = tok_->decode(span_tokens(t, a + 1, e));
         if (!qa.question.empty() && !qa.answer.empty()) {
           qa_.push_back(std::move(qa));
           ++added;
@@ -293,6 +300,16 @@ int run_self_training(const AppOptions& opt) {
   go.top_k = static_cast<int>(c.get_int("chat.top_k", 40));
   go.top_p = static_cast<float>(c.get_num("chat.top_p", 0.95));
   ChatEngine chat(mcfg, &coord, &tel, &hub, &tok, go);
+  MemoryStore memory;
+  {
+    const std::string mem_path =
+        c.get_str("memory.file", opt.workdir + "/memory.jsonl");
+    if (memory.open(mem_path)) {
+      chat.set_memory(&memory, static_cast<int>(c.get_int("memory.top_k", 3)));
+      tel.log("info", "memory", "long term memory ready",
+              {{"file", mem_path}, {"entries", std::to_string(memory.size())}});
+    }
+  }
 
   ContinualTrainer t_cl(&coord, &tel, &hub, mcfg, cl, ContinualConfig::from_config(c),
                         &tok, ds.empty() ? nullptr : &ds, opt.seed + 11);
@@ -312,6 +329,7 @@ int run_self_training(const AppOptions& opt) {
   ctx.opt = &opt;
   ctx.mcfg = &mcfg;
   ctx.quit = &quit;
+  ctx.memory = &memory;
 
   coord.start();
   chat.start();

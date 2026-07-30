@@ -54,6 +54,11 @@ std::string ChatEngine::partial() const {
   return partial_;
 }
 
+std::string ChatEngine::last_memory_block() const {
+  std::lock_guard<std::mutex> g(m_);
+  return last_mem_;
+}
+
 std::vector<ChatTurn> ChatEngine::history() const {
   std::lock_guard<std::mutex> g(m_);
   return history_;
@@ -117,7 +122,16 @@ void ChatEngine::handle(const std::string& text) {
   // produce two different answers, otherwise the feedback thread can never
   // build a preference pair.
   go_.seed = rng_.next_u64() | 1ull;
-  const std::vector<int32_t> prompt = tok_->encode("<|user|>" + text + "<|assistant|>");
+  // Retrieval augmented prompt: what the model was *told* to remember comes
+  // first, then the user turn.
+  std::string mem_block;
+  if (mem_ && mem_->size() > 0) mem_block = mem_->context_block(text, mem_k_);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    last_mem_ = mem_block;
+  }
+  const std::vector<int32_t> prompt =
+      tok_->encode(mem_block + "<|user|>" + text + "<|assistant|>");
   {
     std::lock_guard<std::mutex> g(m_);
     partial_.clear();

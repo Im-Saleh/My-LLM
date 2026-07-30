@@ -27,10 +27,30 @@ sudo ./scripts/install_deps.sh          # کامپایلر، cmake، OpenGL/X11�
 ./build.sh --run-tests                  # → build/slm  (+ ۳۱ تست گرادیان + ۴۲ تست متن)
 ```
 
-### مدل آماده (بدون آموزش)
+### مدل‌های آماده (بدون آموزش)
+
+سه چک‌پوینت در مخزن هست، هر کدام برای یک کار:
+
+| مدل | پارامتر | آموزش | برای چه خوب است |
+|---|---|---|---|
+| `models/demo-fa-base.slm` | **۱۳.۹۹M** | ۱۴.۷M توکن **داده‌ی واقعی** (ویکی‌پدیای فارسی + پایتون + انگلیسی) | ادامه‌دادن متن فارسی واقعی — **۱.۸۷ bits/char** روی holdout ویکی‌پدیا |
+| `models/demo-fa.slm` | **۱۳.۹۹M** | همان + ۳.۴M توکن SFT دستوری | پاسخ‌دهی به سبک چت (ppl ۲.۴۷ روی داده‌ی دستوری) |
+| `models/demo-tri.slm` | ۷.۳۵M | ۳.۷M توکن کورپوس قالبی | دموی پرسش‌وپاسخ دقیق روی همان قالب‌ها |
 
 ```bash
-build/slm chat --ckpt models/demo-tri.slm --tokenizer models/demo-tri.slmtok
+# چت با مدل دستوری
+build/slm chat --ckpt models/demo-fa.slm --tokenizer models/demo-fa.slmtok
+
+# ادامه‌ی متن فارسی با مدل پایه
+build/slm chat --ckpt models/demo-fa-base.slm --tokenizer models/demo-fa.slmtok \
+               --prompt "ایران کشوری در" --max-new 60 --temp 0.7
+# → « سال 1398 به عنوان یکی از آثار ملی ایران، ... جستارهای وابسته،
+#     فهرست شهرهای ...، سازمان میراث فرهنگی، صنایع دستی و گردشگری»
+
+# چت با حافظه‌ی بلندمدت
+build/slm memory --file runs/memory.jsonl add "اسم من صالح است و پایتون کار می‌کنم"
+build/slm chat --ckpt models/demo-fa.slm --tokenizer models/demo-fa.slmtok \
+               --memory runs/memory.jsonl
 ```
 
 ```
@@ -54,10 +74,29 @@ slm> ```python
      ```
 ```
 
-### همه‌ی مسیر، با یک اسکریپت
+### داده‌ی واقعی + آموزش مرحله‌ای، با دو اسکریپت
 
 ```bash
-./scripts/quickstart.sh --config configs/slm-demo.conf --steps 1800 --gui
+# ۱) دانلود + تمیزکاری + dedup + توکنایزر + توکنایز به فایل mmap
+./scripts/update_data.sh --budget-mb 1000 --share "fa=0.55,en=0.15,py=0.30"
+
+# ۲) سه مرحله‌ی آموزش (پیش‌آموزش → anneal کد → SFT دستوری)
+./scripts/train_stages.sh --steps 4000
+LIBTORCH=/opt/libtorch ./scripts/train_stages.sh --steps 4000   # ۴ برابر سریع‌تر
+```
+
+`update_data.sh` واقعاً دانلود می‌کند (ویکی‌پدیای فارسی، `codeparrot-clean`،
+ویکی‌پدیای انگلیسی) و علاوه بر آن **داده‌ی پل** را از docstringهای واقعی کد
+استخراج می‌کند. خروجی این اجرا در همین مخزن:
+
+```
+  fa     725 MB  ->  135.8M توکن        (ویکی‌پدیای فارسی، dedup شده)
+  py     207 MB  ->   69.7M توکن        (codeparrot-clean، فیلتر AST)
+  en     110 MB  ->   37.5M توکن
+  bridge  22 MB  ->    7.0M توکن        (جفت‌های docstring → کد، استخراج‌شده)
+  ------------------------------------------------------------------
+  total 1.02 GB  ->  250.0M توکن  در ۱۲.۶ ثانیه (۱۰۰ MB/s، ۸ رشته)
+                     ۴۷۷MB روی دیسک به‌صورت uint16، mmap بدون مصرف RAM
 ```
 
 یا مرحله‌به‌مرحله:
@@ -106,14 +145,34 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 | [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | توضیح فنی دقیق coordinator و ترکیب سه منبع آپدیت |
 | [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | نمای کلی معماری، نمودار، همزمانی، بودجه‌ی حافظه |
 | [`docs/SCALING.fa.md`](docs/SCALING.fa.md) | **۷ تریلیون پارامتر: اعداد واقعی** و نردبان اندازه‌های عملی |
+| [`docs/TEACHING.fa.md`](docs/TEACHING.fa.md) | **چطور به مدل چیز یاد بدهم** — چهار سطح یادگیری، از حافظه تا fine-tune |
 | [`docs/STEP_BY_STEP.fa.md`](docs/STEP_BY_STEP.fa.md) | پیاده‌سازی گام‌به‌گام |
 
 ---
 
 ## نتایج اندازه‌گیری‌شده
 
-مدل دمو: **۷.۳۵M پارامتر**، ۶ لایه، ۸ هد پرسش / ۲ هد KV، dim 320، ctx 256،
-`rmsnorm+rope+swiglu+gqa8:2`، ۱۸۰۰ گام در ۱۴ دقیقه (libtorch CPU، ۸ هسته).
+مدل اصلی: **۱۳,۹۹۰,۱۷۶ پارامتر** (۱۳.۹۹M)، ۷ لایه (از ۶ **رشد کرده**), ۸ هد پرسش /
+۲ هد KV، dim 384، ffn 1024، ctx 512، vocab 8192،
+`qknorm+rmsnorm+rope+swiglu+gqa8:2`، **۱۷.۹M توکن داده‌ی واقعی** در ۱۰۵ دقیقه
+(libtorch CPU، ۸ هسته، ۲۶۰۰–۳۷۰۰ توکن بر ثانیه).
+
+```
+  source   lang        loss   perplexity  bits/char       (مدل پایه، داده‌ی واقعی)
+  fa       fa        3.8454        46.78     1.8727
+  py       py        3.9496        51.91     1.9281
+  en       en        5.1296       168.95     2.5243
+```
+
+رشد تدریجی پارامترها در حین آموزش، از لاگ واقعی:
+
+```
+>>> GROWTH at step 600: 6 -> 7 layers, 12.441M -> 13.990M parameters (+12.5%)
+step   600 | loss 5.6823 | lr 6.82e-05 | 4.92M tok | 13.990M par
+        >> holdout 5.4803 *best  |  fa 5.6894  en 6.0723  py 5.1768
+```
+
+مدل قبلی (کورپوس قالبی): ۷.۳۵M پارامتر، ۳.۷M توکن.
 
 ```
   source   lang        loss   perplexity  bits/char  chars/tok
@@ -130,9 +189,10 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 
 | مورد | نتیجه |
 |---|---|
-| تست گرادیان | **۳۱/۳۱** بومی، **۳۰/۳۰** libtorch (شامل RoPE/RMSNorm/SwiGLU/GQA و checkpointing) |
+| تست گرادیان | **۳۲/۳۲** بومی (شامل RoPE/RMSNorm/SwiGLU/GQA/z-loss و checkpointing) |
 | تست متن/توکنایزر | **۴۲/۴۲** (UTF-8، نرمال‌سازی فارسی، pretokenize، تشخیص زبان، بررسی پایتون) |
-| fertility فارسی | ۴.۹۵ کاراکتر بر توکن، سهم توکن تک‌بایتی ۱۴.۹٪ |
+| fertility فارسی (داده‌ی واقعی) | ۲.۹۶ کاراکتر بر توکن، سهم توکن تک‌بایتی **۵.۶٪** |
+| توکنایز کردن | ۱۰۰ MB/s موازی → ۲۵۰M توکن در ۱۲.۶ ثانیه، mmap با صفر RAM |
 | GEMM بومی | ۶۱ GFLOP/s تک‌هسته، ۱۸۰ GFLOP/s روی ۸ هسته |
 | آموزش | ۴۲۷۰ tok/s (libtorch CPU) / ~۱۸۰۰ tok/s (بومی) برای همین مدل |
 | تولید با KV-cache | ۳۰–۸۵ tok/s روی CPU |
@@ -158,6 +218,48 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 و پیام می‌دهد؛ داشبورد ترمینالی جایگزین کامل است.
 
 ---
+
+## حافظه‌ی بلندمدت
+
+سه سطح حافظه، جدا و مکمل هم:
+
+```bash
+slm memory --file runs/memory.jsonl add "پروژه‌ی من با C++ نوشته شده" --importance 2
+slm memory --file runs/memory.jsonl search "زبان پروژه من چیست؟"
+#   0.365  #1  [user] اسم من صالح است و به پایتون علاقه دارم
+slm chat --ckpt models/demo-fa.slm --tokenizer models/demo-fa.slmtok --memory runs/memory.jsonl
+```
+
+| سطح | مکانیزم | سرعت | ماندگاری |
+|---|---|---|---|
+| زمینه | پرامپت | فوری | همان گفت‌وگو |
+| **بازیابی** | `MemoryStore`: سه‌گرام کاراکتری هش‌شده + کسینوس، تزریق به‌صورت بلوک `<|system|>` | فوری | فایل JSONL |
+| **وزن‌ها** | دکمه‌ی «teach the weights» → ترد یادگیری مداوم | ثانیه‌ها | دائمی در پارامترها |
+
+بازیابی عمداً **مدل‌مستقل** است (بدون forward pass، زبان‌مستقل، قطعی) تا وقتی
+مدل زیر خودآموزی تغییر می‌کند هم قابل‌اعتماد بماند. در داشبورد پنل مخصوص دارد و
+در ترمینال با `m <متن>` می‌نویسی و با `t` به وزن‌ها منتقل می‌کنی.
+
+## رشد تدریجی پارامترها
+
+مدل می‌تواند **در حین آموزش بزرگ شود**: بلوک بالایی تکرار و وزن‌های خروجی
+باقی‌مانده‌اش صفر می‌شوند، پس بلوک جدید دقیقاً همانی است و loss جهش نمی‌کند
+(Net2Net / progressive stacking). گام‌های اول روی مدل کوچک و ارزان اجرا می‌شوند و
+تعداد پارامتر در لاگ و در داشبورد زنده دیده می‌شود.
+
+```bash
+slm pretrain ... --grow "600:1,1200:1"     # +۱ لایه در گام ۶۰۰ و ۱۲۰۰
+```
+
+## الگوریتم‌های پایداری آموزش (از OLMo/PaLM)
+
+| تکنیک | چه می‌کند | کلید |
+|---|---|---|
+| **QK-norm** | RMSNorm روی q و k قبل از RoPE؛ لاجیت‌های توجه بی‌کران رشد نمی‌کنند (کلید پایداری OLMo 2) | `model.qk_norm` |
+| **z-loss** | جریمه‌ی `logsumexp²` تا تابع پارتیشن softmax نزدیک ۱ بماند (PaLM/OLMo) | `train.zloss` |
+| **WSD schedule** | warmup → فلات → افت ۱-√t؛ هر چک‌پوینت روی فلات نقطه‌ی شروع معتبری است (برخلاف cosine) | `train.schedule=wsd` |
+| **spike skip** | بچی که نُرم گرادیانش ۴ برابر EMA است **اعمال نمی‌شود** | `train.skip_spike` |
+| **resume امن** | معماری از چک‌پوینت خوانده می‌شود نه از کانفیگ (وگرنه لایه‌های رشدیافته دور ریخته می‌شوند) | `--resume` |
 
 ## سیستم خودآموزی (خلاصه)
 
@@ -194,6 +296,8 @@ Fisher damping (EWC) → trust-region هر منبع → تراش TIES → تصو
 slm info        [--config F]                            بودجه‌ی حافظه و بکند
 slm plan        --params 7e12 [--experts N --topk N]     برنامه‌ریز حافظه/محاسبه
 slm tokenizer   --out F [--vocab N] (--input F | --mix ...)   BPE + گزارش fertility
+slm tokenize    --tokenizer F --in fa=F,py=F [--out-dir D]   BPE موازی → باینری mmap
+slm memory      [--file F] add|list|search|context|forget    حافظه‌ی بلندمدت
 slm pretrain    --tokenizer F --out F (--data F | --mix ...)  آموزش با ترکیب وزن‌دار
 slm chat        --ckpt F --tokenizer F [--prompt S]      تولید تعاملی (KV-cache)
 slm eval        --ckpt F --tokenizer F --mix ...         loss/ppl/BPC هر زبان

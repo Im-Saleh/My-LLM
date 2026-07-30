@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/text.h"
 #include "gui.h"
 
 namespace slm {
@@ -86,6 +87,21 @@ std::string trunc(const std::string& s, size_t n) {
   return t;
 }
 
+}  // namespace
+
+int teach_memories(DashboardContext& ctx, size_t n) {
+  if (!ctx.memory || !ctx.hub) return 0;
+  const std::vector<std::string> texts = ctx.memory->consolidate(n);
+  for (const std::string& t : texts) ctx.hub->push_text(t);
+  if (!texts.empty() && ctx.tel)
+    ctx.tel->log("info", "memory",
+                 "queued " + std::to_string(texts.size()) +
+                     " memories for consolidation into the weights");
+  return static_cast<int>(texts.size());
+}
+
+namespace {
+
 void handle_command(DashboardContext& ctx, const std::string& line) {
   Telemetry& tel = *ctx.tel;
   const char cmd = line[0];
@@ -109,6 +125,15 @@ void handle_command(DashboardContext& ctx, const std::string& line) {
   } else if (cmd == 'r') {
     std::vector<ChatTurn> h = ctx.chat->history();
     if (!h.empty()) ctx.chat->rate(h.size() - 1, static_cast<float>(std::atof(rest.c_str())));
+  } else if (cmd == 'm') {
+    if (ctx.memory && !rest.empty()) {
+      const int64_t id = ctx.memory->add(rest, "user");
+      tel.log("info", "memory", "remembered #" + std::to_string(id) + ": " +
+                                    utf8_truncate(rest, 80));
+    }
+  } else if (cmd == 't') {
+    const int n = teach_memories(ctx, 8);
+    tel.log("info", "memory", "teaching " + std::to_string(n) + " memories to the weights");
   }
 }
 
@@ -241,9 +266,18 @@ int run_terminal_dashboard(DashboardContext& ctx) {
     o << "\n" << kBold << "audit log" << kReset << "\n";
     for (const std::string& l : tel.recent_logs(9)) o << "    " << kDim << trunc(l, 150) << kReset << "\n";
 
+    if (ctx.memory) {
+      o << "\n" << kBold << "memory" << kReset << "  " << ctx.memory->size()
+        << " entries";
+      const std::vector<MemoryItem> mi = ctx.memory->all();
+      for (size_t i = mi.size(); i-- > 0 && i + 3 >= mi.size();)
+        o << "\n    #" << mi[i].id << " taught " << mi[i].taught << "  "
+          << trunc(mi[i].text, 100);
+      o << "\n";
+    }
     o << "\n" << kBold << "keys" << kReset
-      << ": [1|2|3] toggle a trainer   [x] emergency stop   [b] restore best   "
-         "[a <text>] ask   [r <score>] rate last   [q] quit\n";
+      << ": [1|2|3] toggle trainer  [x] e-stop  [b] restore best  [a <text>] ask\n"
+         "      [r <score>] rate last  [m <text>] remember  [t] teach memories  [q] quit\n";
     std::fputs(o.str().c_str(), stdout);
     std::fflush(stdout);
 

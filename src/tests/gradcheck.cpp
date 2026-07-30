@@ -213,6 +213,9 @@ void test_ops() {
     const std::vector<int32_t> tg = {1, 3, 6, 0, -100, 5};
     return to_scalar(seq_logprob(v[0], tg, -100), 29);
   });
+  check_grad("z_loss (OLMo/PaLM)", {rnd({4, 7}, 80)}, [](std::vector<Tensor>& v) {
+    return z_loss(v[0]);
+  });
   check_grad("logsigmoid (DPO)", {rnd({5}, 33)}, [](std::vector<Tensor>& v) {
     return to_scalar(logsigmoid(v[0]), 30);
   });

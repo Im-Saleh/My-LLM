@@ -58,6 +58,10 @@ struct GPTConfig {
   PosKind pos = PosKind::kRoPE;
   FFNKind ffn = FFNKind::kSwiGLU;
   bool linear_bias = false;  // modern stacks drop biases
+  // RMSNorm on q and k before RoPE.  OLMo 2 introduced this to stop attention
+  // logits from growing without bound; it is nearly free and removes the most
+  // common cause of loss spikes in long runs.
+  bool qk_norm = true;
   float rope_theta = 10000.0f;
 
   int64_t param_count() const;
@@ -142,6 +146,22 @@ class GPT {
 
   void init_weights(uint64_t seed);
 
+  // ---------------------------------------------------------------- growth
+  // Progressive depth growth (function-preserving "stacking"): the top block is
+  // duplicated and its two residual output projections are zeroed, so the new
+  // block starts as an exact identity and the loss does not jump.  Parameters
+  // therefore *increase while the model trains*, which is both a real training
+  // speed-up (early steps run on a small model) and visible in the dashboard.
+  //   Gong et al., "Efficient Training of BERT by Progressively Stacking"
+  //   Chen et al., "Net2Net"
+  struct GrowthEvent {
+    int64_t step = 0;
+    int64_t layers_before = 0, layers_after = 0;
+    int64_t params_before = 0, params_after = 0;
+  };
+  GrowthEvent grow_depth(int64_t new_blocks, int64_t step);
+  const std::vector<GrowthEvent>& growth_events() const { return growth_; }
+
   const std::vector<std::string>& param_names() const { return order_; }
   Tensor* param(const std::string& name);
   const Tensor* param(const std::string& name) const;
@@ -183,6 +203,7 @@ class GPT {
   std::unordered_map<std::string, Tensor> params_;
   std::vector<std::string> order_;
   std::vector<std::string> trainable_;
+  std::vector<GrowthEvent> growth_;
 };
 
 }  // namespace slm

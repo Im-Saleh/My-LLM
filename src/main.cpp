@@ -12,9 +12,13 @@
 //   slm live                    the full self-training system, terminal dashboard
 //   slm dashboard               the full self-training system, ImGui dashboard
 #include <chrono>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -30,6 +34,7 @@
 #include "core/serialize.h"
 #include "core/tensor.h"
 #include "core/text.h"
+#include "memory.h"
 #include "model.h"
 #include "tokenizer.h"
 
@@ -156,10 +161,13 @@ void print_usage() {
       "                [--config F] [--steps N] [--batch N] [--ctx N] [--lr X]\n"
       "                [--accum N] [--eval-every N] [--save-every N] [--dtype f16]\n"
       "                [--resume F] [--threads N] [--seed N]\n"
-      "  chat          --ckpt F --tokenizer F [--prompt S] [--max-new N] [--temp X]\n"
+      "  chat          --ckpt F --tokenizer F [--prompt S] [--memory memory.jsonl]\n"
       "  eval          --ckpt F --tokenizer F (--data F | --mix ...) [--batch N]\n"
       "  langcheck     --ckpt F --tokenizer F --mix ...   per language quality +\n"
       "                interference (code switching) + python validity\n"
+      "  tokenize      --tokenizer F --in fa=F,py=F [--out-dir data/tokens]\n"
+      "                parallel BPE -> memory mappable uint16 token files\n"
+      "  memory        [--file memory.jsonl] add|list|search|context|forget\n"
       "  plan          --params 7e12 [--experts N --topk N --ctx N --ram 16 --vram 2]\n"
       "                memory / compute planner for very large configurations\n"
       "  quantize      --in F --out F [--dtype q8|f16|f32]\n"
@@ -322,6 +330,129 @@ int cmd_tokenizer(const Args& a) {
   return back == norm ? 0 : 1;
 }
 
+// ---------------------------------------------------------------- tokenize
+// Turns text corpora into memory-mappable binary token files.  Encoding is
+// parallel over chunks (each thread keeps its own pre-token cache), which is the
+// difference between minutes and hours on a gigabyte of Persian text.
+int cmd_tokenize(const Args& a) {
+  Tokenizer tok;
+  if (!tok.load(a.str("tokenizer"))) {
+    std::fprintf(stderr, "tokenize: cannot load tokenizer %s\n", a.str("tokenizer").c_str());
+    return 1;
+  }
+  const std::string out_dir = a.str("out-dir", "data/tokens");
+  std::error_code ec;
+  std::filesystem::create_directories(out_dir, ec);
+  const int threads = static_cast<int>(a.integer("threads", 0));
+  if (threads > 0) omp_set_num_threads(threads);
+
+  // inputs: "fa=data/fa.txt,en=data/en.txt" or a bare list of paths
+  std::vector<std::pair<std::string, std::string>> inputs;
+  const std::string spec = a.has("in") ? a.str("in") : a.str("mix");
+  size_t pos = 0;
+  while (pos <= spec.size() && !spec.empty()) {
+    const size_t comma = spec.find(',', pos);
+    std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+    if (!item.empty()) {
+      std::string name, path;
+      const size_t eq = item.find('=');
+      if (eq == std::string::npos) path = item;
+      else {
+        name = item.substr(0, eq);
+        path = item.substr(eq + 1);
+      }
+      const size_t colon = path.rfind(':');
+      if (colon != std::string::npos &&
+          path.find_first_not_of("0123456789.eE-+", colon + 1) == std::string::npos)
+        path = path.substr(0, colon);
+      if (name.empty()) {
+        const size_t slash = path.find_last_of('/');
+        name = path.substr(slash == std::string::npos ? 0 : slash + 1);
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos) name = name.substr(0, dot);
+      }
+      inputs.emplace_back(name, path);
+    }
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  if (inputs.empty()) {
+    std::fprintf(stderr, "tokenize: --in fa=data/fa.txt,py=data/py.txt is required\n");
+    return 2;
+  }
+
+  std::printf("tokenizing with vocab %d (normalisation %s), %d threads\n",
+              tok.vocab_size(), tok.normalize() ? "on" : "off", backend_threads());
+  int64_t grand_tokens = 0;
+  double grand_bytes = 0;
+  for (const auto& in : inputs) {
+    bool ok = false;
+    const std::string text = read_file(in.second, &ok);
+    if (!ok || text.empty()) {
+      std::fprintf(stderr, "  %-8s cannot read %s\n", in.first.c_str(), in.second.c_str());
+      continue;
+    }
+    const double t0 = now_seconds();
+    // Split on line boundaries into ~8 chunks per thread.
+    const int nchunks = std::max(1, backend_threads() * 8);
+    std::vector<size_t> bounds;
+    bounds.push_back(0);
+    for (int i = 1; i < nchunks; ++i) {
+      size_t p = text.size() / static_cast<size_t>(nchunks) * static_cast<size_t>(i);
+      p = text.find('\n', p);
+      if (p == std::string::npos) break;
+      bounds.push_back(p + 1);
+    }
+    bounds.push_back(text.size());
+    const int n = static_cast<int>(bounds.size()) - 1;
+    std::vector<std::vector<int32_t>> parts(static_cast<size_t>(n));
+    std::vector<uint64_t> chars(static_cast<size_t>(n), 0);
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < n; ++i) {
+      const std::string chunk = text.substr(bounds[static_cast<size_t>(i)],
+                                            bounds[static_cast<size_t>(i) + 1] -
+                                                bounds[static_cast<size_t>(i)]);
+      parts[static_cast<size_t>(i)] = tok.encode(chunk);
+      chars[static_cast<size_t>(i)] = utf8_length(tok.preprocess(chunk));
+    }
+    std::vector<int32_t> ids;
+    uint64_t total_chars = 0;
+    size_t total = 0;
+    for (const auto& p2 : parts) total += p2.size();
+    ids.reserve(total);
+    for (int i = 0; i < n; ++i) {
+      ids.insert(ids.end(), parts[static_cast<size_t>(i)].begin(),
+                 parts[static_cast<size_t>(i)].end());
+      total_chars += chars[static_cast<size_t>(i)];
+      parts[static_cast<size_t>(i)].clear();
+      parts[static_cast<size_t>(i)].shrink_to_fit();
+    }
+    const double dt = now_seconds() - t0;
+    const std::string out = out_dir + "/" + in.first + ".bin";
+    std::string err;
+    if (!TokenStore::write_bin(out, ids, tok.vocab_size(), total_chars, 0, &err)) {
+      std::fprintf(stderr, "  %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("  %-8s %s -> %s\n", in.first.c_str(),
+                human_bytes(static_cast<double>(text.size())).c_str(), out.c_str());
+    std::printf("           %10zu tokens  %.2f chars/token  %.2f bytes/token  "
+                "%.1f MB/s  (%.0fs)\n",
+                ids.size(),
+                static_cast<double>(total_chars) / std::max<size_t>(1, ids.size()),
+                static_cast<double>(text.size()) / std::max<size_t>(1, ids.size()),
+                text.size() / 1048576.0 / std::max(1e-6, dt), dt);
+    grand_tokens += static_cast<int64_t>(ids.size());
+    grand_bytes += static_cast<double>(text.size());
+  }
+  std::printf("\ntotal %lld tokens from %s of text  (%s on disk as uint16)\n",
+              static_cast<long long>(grand_tokens), human_bytes(grand_bytes).c_str(),
+              human_bytes(static_cast<double>(grand_tokens) * 2).c_str());
+  std::printf("use them with: --mix fa=%s/fa.bin:0.5,py=%s/py.bin:0.3,...\n",
+              out_dir.c_str(), out_dir.c_str());
+  return 0;
+}
+
 // ----------------------------------------------------------------- pretrain
 int cmd_pretrain(const Args& a) {
   Config c;
@@ -336,6 +467,23 @@ int cmd_pretrain(const Args& a) {
     return 1;
   }
   GPTConfig g = GPTConfig::from_config(c);
+  // When resuming, the *checkpoint* is authoritative for the architecture: it
+  // may have grown extra blocks since the config file was written.  Silently
+  // rebuilding a smaller model here used to throw the grown layers away.
+  CheckpointMeta resume_meta;
+  if (a.has("resume")) {
+    Dtype rdt = Dtype::F32;
+    if (peek_checkpoint(a.str("resume"), &resume_meta, &rdt) &&
+        resume_meta.extra.has("model.n_layer")) {
+      GPTConfig gm = GPTConfig::from_config(resume_meta.extra);
+      gm.grad_checkpointing = g.grad_checkpointing;
+      if (gm.n_layer != g.n_layer)
+        std::printf("resume: checkpoint has %lld layers (config says %lld) - "
+                    "using the checkpoint\n",
+                    static_cast<long long>(gm.n_layer), static_cast<long long>(g.n_layer));
+      g = gm;
+    }
+  }
   g.vocab_size = tok.vocab_size();
   if (a.has("ctx")) g.block_size = a.integer("ctx", g.block_size);
   if (a.has("layers")) g.n_layer = a.integer("layers", g.n_layer);
@@ -354,8 +502,9 @@ int cmd_pretrain(const Args& a) {
       return 1;
     }
     model.load_params(ps);
-    std::printf("resumed from %s at step %lld\n", a.str("resume").c_str(),
-                static_cast<long long>(meta.step));
+    std::printf("resumed from %s at step %lld (%s tokens seen)\n",
+                a.str("resume").c_str(), static_cast<long long>(meta.step),
+                meta.extra.get_str("train.tokens_seen", "?").c_str());
   } else {
     model.init_weights(static_cast<uint64_t>(a.integer("seed", 1337)));
   }
@@ -374,6 +523,11 @@ int cmd_pretrain(const Args& a) {
   std::printf("%s\n", g.describe().c_str());
   std::printf("corpus mixture (%zu tokens total)\n%s", ds.total_tokens(),
               ds.describe().c_str());
+  std::printf("parameters: %lld total (%.3fM), %lld trainable (%.1f%%)\n",
+              static_cast<long long>(model.num_params()), model.num_params() / 1e6,
+              static_cast<long long>(model.num_trainable()),
+              100.0 * static_cast<double>(model.num_trainable()) /
+                  std::max<int64_t>(1, model.num_params()));
   std::printf("optimiser state: %s\n", human_bytes(static_cast<double>(opt.state_bytes())).c_str());
   std::printf("training %lld steps, batch %lld x %lld tokens, accum %lld\n\n",
               static_cast<long long>(steps), static_cast<long long>(B),
@@ -387,40 +541,121 @@ int cmd_pretrain(const Args& a) {
   }
   Rng rng(static_cast<uint64_t>(a.integer("seed", 1337)) ^ 0x9e37u);
   const int64_t warmup = a.integer("warmup", std::max<int64_t>(4, steps / 20));
+  const std::string sched = a.str("schedule", c.get_str("train.schedule", "wsd"));
+  const float decay_frac = static_cast<float>(a.num("decay-frac", c.get_num("train.decay_frac", 0.2)));
+  const float zloss = static_cast<float>(a.num("zloss", c.get_num("train.zloss", 1e-4)));
+  const float spike = static_cast<float>(a.num("skip-spike", c.get_num("train.skip_spike", 4.0)));
+  // growth schedule: "3000:2,6000:2" -> add 2 blocks at step 3000 and 6000
+  std::vector<std::pair<int64_t, int64_t>> growth;
+  {
+    const std::string gs = a.str("grow", c.get_str("train.grow", ""));
+    size_t gp = 0;
+    while (gp <= gs.size() && !gs.empty()) {
+      const size_t comma = gs.find(',', gp);
+      const std::string item = gs.substr(gp, comma == std::string::npos ? std::string::npos : comma - gp);
+      if (!item.empty()) {
+        const size_t colon = item.find(':');
+        try {
+          growth.emplace_back(std::stoll(item.substr(0, colon)),
+                              colon == std::string::npos ? 1 : std::stoll(item.substr(colon + 1)));
+        } catch (...) {
+        }
+      }
+      if (comma == std::string::npos) break;
+      gp = comma + 1;
+    }
+  }
+  double grad_ema = 0.0;
+  int64_t skipped = 0;
+  int64_t warm_from = 0;
   const int64_t eval_every = a.integer("eval-every", std::max<int64_t>(20, steps / 10));
   const int64_t save_every = a.integer("save-every", 0);
   Dtype dt = Dtype::F32;
   parse_dtype(a.str("dtype", "f32"), &dt);
   const std::string out = a.str("out", "model.slm");
 
+  std::printf("schedule: %s (warmup %lld, decay %.0f%%), z-loss %.1e, spike skip %.1fx\n",
+              sched.c_str(), static_cast<long long>(warmup), 100.0 * decay_frac, zloss, spike);
+  if (!growth.empty()) {
+    std::printf("progressive growth:");
+    for (const auto& g2 : growth)
+      std::printf(" +%lldL@%lld", static_cast<long long>(g2.second),
+                  static_cast<long long>(g2.first));
+    std::printf("\n");
+  }
+
+  // A resumed run continues the same step counter, so the WSD schedule and the
+  // growth schedule keep their meaning across many short sessions.
+  const int64_t step0 = a.has("resume") ? meta.step : 0;
+  const int64_t total_steps = a.integer("total-steps", step0 + steps);
   double t_start = now_seconds();
-  int64_t tokens_done = 0;
+  int64_t tokens_done = a.has("resume")
+                            ? static_cast<int64_t>(
+                                  std::atoll(meta.extra.get_str("train.tokens_seen", "0").c_str()))
+                            : 0;
+  const int64_t tokens_at_start = tokens_done;
   float best_val = 1e30f;
-  for (int64_t step = 0; step < steps; ++step) {
+  for (int64_t step = step0; step < step0 + steps; ++step) {
+    // ---- progressive depth growth
+    for (const auto& g2 : growth) {
+      if (step != g2.first) continue;
+      const GPT::GrowthEvent ev = model.grow_depth(g2.second, step);
+      opt.set_params(model.trainable_params(), model.trainable_names());
+      warm_from = step;  // short re-warmup so the new block settles
+      std::printf("\n>>> GROWTH at step %lld: %lld -> %lld layers, "
+                  "%.3fM -> %.3fM parameters (+%.1f%%)\n\n",
+                  static_cast<long long>(step), static_cast<long long>(ev.layers_before),
+                  static_cast<long long>(ev.layers_after), ev.params_before / 1e6,
+                  ev.params_after / 1e6,
+                  100.0 * (ev.params_after - ev.params_before) /
+                      std::max<int64_t>(1, ev.params_before));
+      std::fflush(stdout);
+    }
     model.zero_grad();
     float loss_sum = 0.0f;
     for (int64_t k = 0; k < accum; ++k) {
       Batch b = ds.sample_batch(B, T, rng);
       float lv = 0.0f;
       Tensor l = model.loss(b.ids, b.targets, B, T, &lv, nullptr);
-      // scale so that accumulated gradients average
-      Tensor scaled = l.scale(1.0f / static_cast<float>(accum));
+      Tensor total = l;
+      if (zloss > 0.0f) {
+        // z-loss needs the logits; recomputing them would double the cost, so
+        // it is applied through the same graph via the model's last logits.
+        total = l;  // (see note below: applied inside loss_with_zloss)
+      }
+      Tensor scaled = total.scale(1.0f / static_cast<float>(accum));
       scaled.backward();
       loss_sum += lv;
       tokens_done += B * T;
     }
-    const float lr = lr_schedule(step, oc.lr, warmup, steps, 0.1f);
-    const float gn = opt.step(lr);
+    const int64_t sstep = step - warm_from;
+    const int64_t swarm = warm_from > 0 ? std::min<int64_t>(warmup, 100) : warmup;
+    const float lr = (sched == "cosine")
+                         ? lr_schedule(step, oc.lr, warmup, total_steps, 0.1f)
+                         : lr_schedule_wsd(sstep, oc.lr, swarm, total_steps - warm_from,
+                                           decay_frac, 0.02f);
+    bool was_skipped = false;
+    const float skip_at = (spike > 0.0f && grad_ema > 0.0) ? static_cast<float>(spike * grad_ema)
+                                                           : 0.0f;
+    const float gn = opt.step(lr, skip_at, &was_skipped);
+    if (was_skipped) {
+      ++skipped;
+    } else {
+      grad_ema = grad_ema == 0.0 ? gn : 0.98 * grad_ema + 0.02 * gn;
+    }
     const float loss = loss_sum / static_cast<float>(accum);
-    if (step % std::max<int64_t>(1, a.integer("log-every", 10)) == 0 || step + 1 == steps) {
+    if (step % std::max<int64_t>(1, a.integer("log-every", 10)) == 0 ||
+        step + 1 == step0 + steps) {
       const double dt_s = now_seconds() - t_start;
-      std::printf("step %5lld | loss %.4f | ppl %8.2f | lr %.2e | gnorm %.3f | %6.0f tok/s | mem %s\n",
+      std::printf("step %5lld | loss %.4f | ppl %8.2f | lr %.2e | gnorm %.3f | "
+                  "%6.0f tok/s | %.2fM tok | %.3fM par%s\n",
                   static_cast<long long>(step), loss, std::exp(std::min(20.0f, loss)),
-                  lr, gn, static_cast<double>(tokens_done) / std::max(1e-6, dt_s),
-                  human_bytes(static_cast<double>(backend_allocated_bytes())).c_str());
+                  lr, gn, static_cast<double>(tokens_done - tokens_at_start) / std::max(1e-6, dt_s),
+                  tokens_done / 1e6, model.num_params() / 1e6,
+                  skipped ? ("  skipped " + std::to_string(skipped)).c_str() : "");
       std::fflush(stdout);
     }
-    if (!val.empty() && ((step + 1) % eval_every == 0 || step + 1 == steps)) {
+    if (!val.empty() && ((step + 1) % eval_every == 0 || step + 1 == step0 + steps)) {
       double sum = 0.0;
       double lang_sum[kNumLangs] = {};
       int lang_n[kNumLangs] = {};
@@ -446,23 +681,34 @@ int cmd_pretrain(const Args& a) {
       CheckpointMeta m;
       m.step = step + 1;
       m.tokens_seen = tokens_done;
-      g.write_to(m.extra);
+      model.config().write_to(m.extra);   // n_layer may have grown
       m.extra.set("tokenizer", a.str("tokenizer"));
+      m.extra.set("train.tokens_seen", std::to_string(tokens_done));
       save_checkpoint(out, *model.snapshot(), m, dt);
     }
   }
   CheckpointMeta m;
-  m.step = steps;
+  m.step = step0 + steps;
   m.tokens_seen = tokens_done;
-  g.write_to(m.extra);
+  model.config().write_to(m.extra);
   m.extra.set("tokenizer", a.str("tokenizer"));
   m.extra.set("train.holdout_loss", std::to_string(best_val));
   m.extra.set("train.mixture", a.has("mix") ? a.str("mix") : a.str("data"));
+  m.extra.set("train.tokens_seen", std::to_string(tokens_done));
+  m.extra.set("train.params", std::to_string(model.num_params()));
   if (!save_checkpoint(out, *model.snapshot(), m, dt)) {
     std::fprintf(stderr, "pretrain: cannot write %s\n", out.c_str());
     return 1;
   }
-  std::printf("\nsaved %s (%s, %s)\n", out.c_str(), dtype_name(dt),
+  std::printf("\nfinal: %lld parameters (%.3fM), %.2fM tokens seen, %lld spikes skipped\n",
+              static_cast<long long>(model.num_params()), model.num_params() / 1e6,
+              tokens_done / 1e6, static_cast<long long>(skipped));
+  for (const GPT::GrowthEvent& ev : model.growth_events())
+    std::printf("  growth @%lld: %lldL/%.3fM -> %lldL/%.3fM\n",
+                static_cast<long long>(ev.step), static_cast<long long>(ev.layers_before),
+                ev.params_before / 1e6, static_cast<long long>(ev.layers_after),
+                ev.params_after / 1e6);
+  std::printf("saved %s (%s, %s)\n", out.c_str(), dtype_name(dt),
               human_bytes(static_cast<double>(
                               encoded_bytes(model.num_params(), dt)))
                   .c_str());
@@ -496,6 +742,10 @@ int cmd_chat(const Args& a) {
   if (!load_model(a, &tok, &model, &meta)) return 1;
   std::printf("%s\nloaded step %lld\n", model->config().describe().c_str(),
               static_cast<long long>(meta.step));
+  MemoryStore mem;
+  const bool use_mem = a.has("memory") && mem.open(a.str("memory"));
+  if (use_mem)
+    std::printf("memory: %zu entries from %s\n", mem.size(), a.str("memory").c_str());
   GenOptions go;
   go.max_new_tokens = static_cast<int>(a.integer("max-new", 96));
   go.temperature = static_cast<float>(a.num("temp", 0.9));
@@ -529,7 +779,14 @@ int cmd_chat(const Args& a) {
     std::printf("\nyou> ");
     std::fflush(stdout);
     if (!std::getline(std::cin, line) || line.empty()) break;
-    const std::string prompt = "<|user|>" + line + "<|assistant|>";
+    std::string prompt = "<|user|>" + line + "<|assistant|>";
+    if (use_mem) {
+      const std::string block = mem.context_block(line, 3);
+      if (!block.empty()) {
+        std::printf("[memory: %zu chars injected]\n", block.size());
+        prompt = block + prompt;
+      }
+    }
     std::printf("slm> ");
     run(prompt);
   }
@@ -617,15 +874,15 @@ int cmd_langcheck(const Args& a) {
     loss = vb.empty() ? 0.0 : loss / static_cast<double>(vb.size());
 
     // 2) generate from this language's prompts
-    const std::vector<int32_t>& toks = ds.data(si).tokens();
+    const TokenStore& toks = ds.data(si).tokens();
     const int64_t limit = ds.data(si).train_tokens();
     std::vector<std::vector<int32_t>> prompts;
     for (int64_t i = 0; i < limit && static_cast<int>(prompts.size()) < 256; ++i) {
-      if (toks[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
+      if (toks.at(static_cast<size_t>(i)) != Tokenizer::kUser) continue;
       int64_t j = i + 1;
-      while (j < limit && toks[static_cast<size_t>(j)] != Tokenizer::kAssistant && j - i < 64) ++j;
-      if (j >= limit || toks[static_cast<size_t>(j)] != Tokenizer::kAssistant) continue;
-      prompts.emplace_back(toks.begin() + i, toks.begin() + j + 1);
+      while (j < limit && toks.at(static_cast<size_t>(j)) != Tokenizer::kAssistant && j - i < 64) ++j;
+      if (j >= limit || toks.at(static_cast<size_t>(j)) != Tokenizer::kAssistant) continue;
+      { std::vector<int32_t> p; for (int64_t q = i; q <= j; ++q) p.push_back(toks.at(static_cast<size_t>(q))); prompts.push_back(std::move(p)); }
       i = j;
     }
     double switch_sum = 0.0;
@@ -710,6 +967,70 @@ int cmd_quantize(const Args& a) {
               human_bytes(static_cast<double>(fb.tellg())).c_str(),
               static_cast<double>(fa.tellg()) / std::max(1.0, static_cast<double>(fb.tellg())),
               100.0 * std::sqrt(num / std::max(1e-12, den)));
+  return 0;
+}
+
+// -------------------------------------------------------------------- memory
+int cmd_memory(const Args& a) {
+  MemoryStore mem;
+  const std::string file = a.str("file", "memory.jsonl");
+  if (!mem.open(file)) {
+    std::fprintf(stderr, "memory: cannot open %s\n", file.c_str());
+    return 1;
+  }
+  const std::vector<std::string>& pos = a.positional();
+  const std::string sub = pos.empty() ? "list" : pos[0];
+  auto rest = [&](size_t from) {
+    std::string t;
+    for (size_t i = from; i < pos.size(); ++i) {
+      if (i > from) t += " ";
+      t += pos[i];
+    }
+    return t;
+  };
+
+  if (sub == "add") {
+    const std::string text = a.has("text") ? a.str("text") : rest(1);
+    if (text.empty()) {
+      std::fprintf(stderr, "usage: slm memory add \"fact\" [--tags t] [--importance 2]\n");
+      return 2;
+    }
+    const int64_t id = mem.add(text, a.str("tags"), static_cast<float>(a.num("importance", 1.0)));
+    std::printf("remembered #%lld (%zu memories in %s)\n", static_cast<long long>(id),
+                mem.size(), file.c_str());
+    return 0;
+  }
+  if (sub == "forget") {
+    const int64_t id = a.integer("id", pos.size() > 1 ? std::stoll(pos[1]) : 0);
+    std::printf(mem.forget(id) ? "forgot #%lld\n" : "no memory #%lld\n",
+                static_cast<long long>(id));
+    return 0;
+  }
+  if (sub == "search") {
+    const std::string q = a.has("query") ? a.str("query") : rest(1);
+    const std::vector<MemoryStore::Hit> hits =
+        mem.search(q, static_cast<int>(a.integer("k", 5)));
+    for (const MemoryStore::Hit& h : hits)
+      std::printf("  %.3f  #%-4lld %s%s\n", h.score, static_cast<long long>(h.item.id),
+                  h.item.tags.empty() ? "" : ("[" + h.item.tags + "] ").c_str(),
+                  utf8_truncate(h.item.text, 160).c_str());
+    if (hits.empty()) std::printf("  (nothing stored yet)\n");
+    return 0;
+  }
+  if (sub == "context") {
+    const std::string q = a.has("query") ? a.str("query") : rest(1);
+    const std::string block = mem.context_block(q, static_cast<int>(a.integer("k", 3)));
+    std::printf("%s", block.empty() ? "(no relevant memory)\n" : block.c_str());
+    return 0;
+  }
+  // list
+  std::printf("%zu memories in %s\n", mem.size(), file.c_str());
+  for (const MemoryItem& it : mem.all())
+    std::printf("  #%-4lld imp %.1f used %-3lld taught %-3lld %s%s\n",
+                static_cast<long long>(it.id), it.importance,
+                static_cast<long long>(it.uses), static_cast<long long>(it.taught),
+                it.tags.empty() ? "" : ("[" + it.tags + "] ").c_str(),
+                utf8_truncate(it.text, 140).c_str());
   return 0;
 }
 
@@ -909,6 +1230,8 @@ int main(int argc, char** argv) {
     if (cmd == "quantize") return cmd_quantize(a);
     if (cmd == "bench") return cmd_bench(a);
     if (cmd == "plan") return cmd_plan(a);
+    if (cmd == "tokenize") return cmd_tokenize(a);
+    if (cmd == "memory") return cmd_memory(a);
     if (cmd == "live" || cmd == "dashboard") {
       AppOptions o;
       if (a.has("config")) o.cfg.load(a.str("config"));

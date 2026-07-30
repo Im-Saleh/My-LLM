@@ -329,6 +329,49 @@ void coordinator_panel(DashboardContext& ctx) {
   ImGui::TextWrapped("last decision: %s", cs.last_decision.c_str());
 }
 
+// Long term memory: write, inspect, and push into the weights.
+void memory_panel(DashboardContext& ctx, char* buf, size_t buf_size) {
+  if (!ctx.memory) {
+    ImGui::TextDisabled("memory store not available");
+    return;
+  }
+  ImGui::Text("%zu memories", ctx.memory->size());
+  ImGui::SameLine();
+  if (ImGui::SmallButton("teach the weights")) {
+    const int n = teach_memories(ctx, 8);
+    ctx.tel->log("info", "memory",
+                 "queued " + std::to_string(n) + " memories for the continual thread");
+  }
+  ImGui::SetNextItemWidth(-70);
+  const bool enter =
+      ImGui::InputText("##mem", buf, buf_size, ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  const bool add = ImGui::Button("remember", ImVec2(64, 0));
+  if ((enter || add) && buf[0] != '\0') {
+    ctx.memory->add(buf, "user");
+    buf[0] = '\0';
+  }
+  if (buf[0] != '\0' && needs_shaping(buf)) ui_line(buf);
+  const std::string block = ctx.chat->last_memory_block();
+  if (!block.empty()) {
+    ImGui::TextDisabled("last retrieved:");
+    const ImVec4 dim(0.6f, 0.75f, 0.9f, 1.0f);
+    ui_wrapped(block.substr(std::min<size_t>(block.size(), 10)), &dim);
+  }
+  ImGui::BeginChild("memlist", ImVec2(0, 120), ImGuiChildFlags_Border);
+  for (const MemoryItem& it : ctx.memory->all()) {
+    ImGui::PushID(static_cast<int>(it.id));
+    if (ImGui::SmallButton("x")) ctx.memory->forget(it.id);
+    ImGui::SameLine();
+    ImGui::TextDisabled("#%lld t%lld", static_cast<long long>(it.id),
+                        static_cast<long long>(it.taught));
+    ImGui::SameLine();
+    ui_wrapped(it.text);
+    ImGui::PopID();
+  }
+  ImGui::EndChild();
+}
+
 void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
   ImGui::BeginChild("history", ImVec2(0, -70), ImGuiChildFlags_Border);
   std::vector<ChatTurn> h = ctx.chat->history();
@@ -450,6 +493,7 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   float window_seconds = 180.0f;
   int layer = 0, head = 0;
   char input[1024] = {0};
+  char mem_input[512] = {0};
   const double t0 = Telemetry::now();
 
   while (!glfwWindowShouldClose(win) && !ctx.quit->load()) {
@@ -467,10 +511,11 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar);
     const CoordinatorStats cs = ctx.coord->stats();
-    ImGui::Text("%s   |   backend %s   |   weights v%llu   |   uptime %.0fs   |   tensors %.1f MiB",
-                ctx.mcfg->describe().c_str(), backend_name(),
-                static_cast<unsigned long long>(cs.weight_version), Telemetry::now() - t0,
-                backend_allocated_bytes() / (1024.0 * 1024.0));
+    ImGui::Text("%s   |   %.3fM parameters   |   backend %s   |   weights v%llu   |   "
+                "uptime %.0fs   |   tensors %.1f MiB",
+                ctx.mcfg->describe().c_str(), ctx.mcfg->param_count() / 1e6,
+                backend_name(), static_cast<unsigned long long>(cs.weight_version),
+                Telemetry::now() - t0, backend_allocated_bytes() / (1024.0 * 1024.0));
     ImGui::SameLine(disp.x - 430);
     if (ctx.tel->stopped()) {
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.2f, 1.0f));
@@ -521,6 +566,9 @@ int run_imgui_dashboard(DashboardContext& ctx) {
     ImGui::Separator();
     ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.9f, 1.0f), "next token distribution");
     token_panel(*ctx.tel);
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.6f, 1.0f), "long term memory");
+    memory_panel(ctx, mem_input, sizeof(mem_input));
     ImGui::End();
 
     // ----------------------------------------------------- chat + audit log

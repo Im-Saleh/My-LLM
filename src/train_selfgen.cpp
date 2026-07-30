@@ -51,14 +51,15 @@ void SelfGenTrainer::build_prompt_pools() {
     Pool pool;
     pool.source = si;
     pool.lang = corpus_->info(si).lang;
-    const std::vector<int32_t>& t = corpus_->data(si).tokens();
+    const TokenStore& t = corpus_->data(si).tokens();
     const int64_t limit = corpus_->data(si).train_tokens();
     for (int64_t i = 0; i < limit && pool.prompts.size() < 1024; ++i) {
-      if (t[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
+      if (t.at(static_cast<size_t>(i)) != Tokenizer::kUser) continue;
       int64_t j = i + 1;
-      while (j < limit && t[static_cast<size_t>(j)] != Tokenizer::kAssistant && j - i < 64) ++j;
-      if (j >= limit || t[static_cast<size_t>(j)] != Tokenizer::kAssistant) continue;
-      std::vector<int32_t> p(t.begin() + i, t.begin() + j + 1);  // markers included
+      while (j < limit && t.at(static_cast<size_t>(j)) != Tokenizer::kAssistant && j - i < 64) ++j;
+      if (j >= limit || t.at(static_cast<size_t>(j)) != Tokenizer::kAssistant) continue;
+      std::vector<int32_t> p;
+      for (int64_t q = i; q <= j; ++q) p.push_back(t.at(static_cast<size_t>(q)));
       if (p.size() >= 3) pool.prompts.push_back(std::move(p));
       i = j;
     }
@@ -66,8 +67,10 @@ void SelfGenTrainer::build_prompt_pools() {
       for (int i = 0; i < 128; ++i) {
         const int64_t off = static_cast<int64_t>(
             rng_.below(static_cast<uint64_t>(std::max<int64_t>(1, limit - 24))));
-        pool.prompts.emplace_back(t.begin() + off,
-                                  t.begin() + std::min<int64_t>(limit, off + 12));
+        std::vector<int32_t> w;
+        for (int64_t q = off; q < std::min<int64_t>(limit, off + 12); ++q)
+          w.push_back(t.at(static_cast<size_t>(q)));
+        pool.prompts.push_back(std::move(w));
       }
     }
     if (!pool.prompts.empty()) pools_.push_back(std::move(pool));

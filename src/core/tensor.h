@@ -130,6 +130,11 @@ Tensor seq_logprob(const Tensor& logits, const std::vector<int32_t>& targets,
 
 Tensor logsigmoid(const Tensor& x);
 
+// mean over rows of logsumexp(row)^2 -- the "z-loss" of PaLM/OLMo.  Adding a
+// small multiple of it to the objective keeps the softmax partition function
+// near 1 and removes the logit-drift instability that kills long runs.
+Tensor z_loss(const Tensor& logits);
+
 // Rotary position embedding on [B, H, T, D] (D must be even).  `pos_offset`
 // makes it work with a KV cache: the query of step t is rotated by t, not by 0.
 Tensor rope(const Tensor& x, int64_t pos_offset, float theta);
@@ -167,6 +172,8 @@ bool grad_enabled();
 const char* backend_name();
 void backend_init(int threads, bool prefer_cuda);
 bool backend_on_gpu();
+// Threads the backend will use for one operation (backend agnostic).
+int backend_threads();
 // Bytes currently held by live tensor storages (native backend only, else 0).
 size_t backend_allocated_bytes();
 

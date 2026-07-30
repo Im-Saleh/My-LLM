@@ -32,7 +32,11 @@ class AdamW {
   void reset_state();
 
   // Applies clipping then one AdamW update. Returns the pre-clip gradient norm.
-  float step(float lr_override = -1.0f);
+  // When `skip_above > 0` and the gradient norm exceeds it, the update is
+  // *skipped* entirely (a loss spike caused by one bad batch cannot damage the
+  // weights) and `*skipped` is set.
+  float step(float lr_override = -1.0f, float skip_above = 0.0f,
+             bool* skipped = nullptr);
 
   int64_t num_steps() const { return t_; }
   size_t state_bytes() const;
@@ -48,5 +52,12 @@ class AdamW {
 // Linear warmup + cosine decay down to `min_ratio * base_lr`.
 float lr_schedule(int64_t step, float base_lr, int64_t warmup, int64_t total,
                   float min_ratio = 0.1f);
+
+// Warmup-Stable-Decay: warmup, then a long constant plateau, then a short decay
+// to ~0 over the last `decay_frac` of the run.  This is what makes "continue
+// training later" practical: any checkpoint on the plateau is a valid starting
+// point, unlike a cosine schedule which bakes the total step count in.
+float lr_schedule_wsd(int64_t step, float base_lr, int64_t warmup, int64_t total,
+                      float decay_frac = 0.2f, float min_ratio = 0.02f);
 
 }  // namespace slm

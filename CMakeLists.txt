@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.16)
-project(slm VERSION 0.2.0 LANGUAGES CXX)
+project(slm VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +26,7 @@ set(SLM_CORE_SOURCES
   src/core/serialize.cpp
   src/core/tensor_common.cpp
   src/core/text.cpp
+  src/memory.cpp
   src/model.cpp
   src/tokenizer.cpp
 )

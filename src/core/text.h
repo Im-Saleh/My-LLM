@@ -78,7 +78,9 @@ struct TextStats {
   size_t latin = 0;
   size_t digits = 0;
   size_t lines = 0;
-  size_t code_signals = 0;   // def/import/return/self/:/=/() and indentation
+  size_t code_signals = 0;   // keyword hits
+  size_t struct_lines = 0;   // indented lines + lines ending in ':'
+  double struct_ratio = 0.0; // share of structurally code-like lines
   double code_score = 0.0;   // 0..1
   double arabic_ratio = 0.0;
   double latin_ratio = 0.0;
