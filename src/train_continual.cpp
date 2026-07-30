@@ -18,7 +18,7 @@ ContinualTrainer::ContinualTrainer(Coordinator* coord, Telemetry* tel,
                                    InteractionHub* hub, const GPTConfig& mcfg,
                                    const TrainerConfig& tcfg,
                                    const ContinualConfig& ccfg, const Tokenizer* tok,
-                                   const TokenDataset* corpus, uint64_t seed)
+                                   const MixtureDataset* corpus, uint64_t seed)
     : TrainerBase(Source::kContinual, coord, tel, mcfg, tcfg, tok, corpus, seed),
       hub_(hub),
       ccfg_(ccfg) {}
@@ -49,7 +49,9 @@ void ContinualTrainer::round() {
   const int64_t ctx = std::min<int64_t>(tcfg_.ctx, mcfg_.block_size);
   std::vector<std::vector<int32_t>> seqs;
   size_t chars = 0;
+  int per_lang[kNumLangs] = {};
   for (const std::string& s : take) {
+    ++per_lang[static_cast<int>(detect_language(s))];
     std::vector<int32_t> ids = tok_->encode(s);
     if (ids.empty()) continue;
     ids.push_back(Tokenizer::kEot);
@@ -80,10 +82,16 @@ void ContinualTrainer::round() {
   int64_t steps = 0;
   const float after = train_batches(batches, &steps);
 
-  char note[256];
+  std::string langs;
+  for (int l = 0; l < kNumLangs; ++l)
+    if (per_lang[l]) {
+      if (!langs.empty()) langs += "/";
+      langs += std::string(lang_code(static_cast<Lang>(l))) + ":" + std::to_string(per_lang[l]);
+    }
+  char note[320];
   std::snprintf(note, sizeof(note),
-                "%zu user samples (%zu chars) + %lld replay batches, %lld steps",
-                seqs.size(), chars, static_cast<long long>(n_replay),
+                "%zu user samples [%s] (%zu chars) + %lld replay batches, %lld steps",
+                seqs.size(), langs.c_str(), chars, static_cast<long long>(n_replay),
                 static_cast<long long>(steps));
   submit_delta(before, after, static_cast<int64_t>(seqs.size()), steps, note);
 }

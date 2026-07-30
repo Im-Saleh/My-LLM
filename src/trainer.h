@@ -47,7 +47,7 @@ class TrainerBase {
  public:
   TrainerBase(Source src, Coordinator* coord, Telemetry* tel, const GPTConfig& mcfg,
               const TrainerConfig& tcfg, const Tokenizer* tok,
-              const TokenDataset* corpus, uint64_t seed);
+              const MixtureDataset* corpus, uint64_t seed);
   virtual ~TrainerBase();
 
   void start();
@@ -66,7 +66,9 @@ class TrainerBase {
   float step_on(const Batch& b);
   // CE training over a list of batches, `local_steps` passes.
   float train_batches(const std::vector<Batch>& batches, int64_t* steps_done);
-  // Mixes replay batches from the base corpus (anti forgetting).
+  // Mixes replay batches from the base corpus (anti forgetting).  Replay is
+  // *round robin over the languages*, never a weighted draw: a round that only
+  // saw Persian user data still gets English and Python gradients.
   void add_replay(std::vector<Batch>* batches, int64_t how_many);
   void submit_delta(float loss_start, float loss_end, int64_t samples,
                     int64_t steps, const std::string& note);
@@ -78,7 +80,7 @@ class TrainerBase {
   Coordinator* coord_;
   Telemetry* tel_;
   const Tokenizer* tok_;
-  const TokenDataset* corpus_;
+  const MixtureDataset* corpus_;
   TrainerConfig tcfg_;
   GPTConfig mcfg_;
   std::unique_ptr<GPT> model_;

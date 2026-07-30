@@ -7,24 +7,54 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "core/text.h"
+
 namespace slm {
 namespace {
 
-enum CharClass { kSpace = 0, kLetter = 1, kDigit = 2, kOther = 3 };
-
-inline int char_class(unsigned char c) {
-  if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f')
-    return kSpace;
-  if (c >= 0x80) return kLetter;  // keep UTF-8 sequences together
-  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') return kLetter;
-  if (c >= '0' && c <= '9') return kDigit;
-  return kOther;
-}
-
-constexpr size_t kMaxChunk = 48;  // hard cap so no single token explodes
+constexpr size_t kMaxChunkChars = 24;  // hard cap so that no token explodes
+constexpr size_t kMaxDigitRun = 1;     // one token per digit -> better arithmetic
 
 const char* kSpecialNames[Tokenizer::kNumSpecial] = {
     "<|endoftext|>", "<|user|>", "<|assistant|>", "<|system|>"};
+
+// Returns the end offset of the pre-token that starts at byte offset `i`.
+//
+// Code-point aware on purpose:
+//   * one leading space joins the following word (GPT-2 behaviour),
+//   * a run of spaces/newlines is one piece (Python indentation),
+//   * ZWNJ (U+200C) has the Arabic class, so "می‌رود" stays a single piece,
+//   * Persian punctuation (، ؛ ؟ « ») is its own piece and never glues to a word,
+//   * digits are emitted one by one.
+size_t chunk_end(const std::string& t, size_t i) {
+  const size_t n = t.size();
+  size_t j = i;
+  uint32_t cp = utf8_next(t, &j);
+  size_t after_first = j;
+  if (cp == ' ' && j < n) {
+    size_t k = j;
+    const uint32_t nxt = utf8_next(t, &k);
+    if (classify(nxt) != CharClass::kSpace) {
+      cp = nxt;
+      after_first = k;
+    }
+  }
+  const CharClass cls = classify(cp);
+  size_t chars = 1;
+  size_t end = after_first;
+  const size_t cap = (cls == CharClass::kDigit)
+                         ? kMaxDigitRun
+                         : (cls == CharClass::kPunct ? 1 : kMaxChunkChars);
+  while (end < n && chars < cap) {
+    size_t k = end;
+    const uint32_t next = utf8_next(t, &k);
+    if (next == '<' && k < n && t[k] == '|') break;  // control token spelling
+    if (classify(next) != cls) break;
+    end = k;
+    ++chars;
+  }
+  return end;
+}
 
 }  // namespace
 
@@ -44,35 +74,27 @@ void Tokenizer::rebuild_pieces() {
   }
 }
 
+std::string Tokenizer::preprocess(const std::string& text) const {
+  return normalize_ ? normalize_persian(text) : text;
+}
+
 std::vector<std::string> Tokenizer::pretokenize(const std::string& text) {
   std::vector<std::string> out;
-  const size_t n = text.size();
   size_t i = 0;
-  while (i < n) {
-    const size_t start = i;
-    if (text[i] == ' ' && i + 1 < n &&
-        char_class(static_cast<unsigned char>(text[i + 1])) != kSpace)
-      ++i;
-    const int c = char_class(static_cast<unsigned char>(text[i]));
-    if (c == kSpace) {
-      while (i < n && char_class(static_cast<unsigned char>(text[i])) == kSpace &&
-             i - start < kMaxChunk)
-        ++i;
-    } else {
-      while (i < n && char_class(static_cast<unsigned char>(text[i])) == c &&
-             i - start < kMaxChunk)
-        ++i;
-    }
-    out.emplace_back(text, start, i - start);
+  while (i < text.size()) {
+    const size_t e = chunk_end(text, i);
+    out.emplace_back(text, i, e - i);
+    i = e;
   }
   return out;
 }
 
-void Tokenizer::train(const std::string& text, int32_t vocab_size, int min_pair_freq,
+void Tokenizer::train(const std::string& raw_text, int32_t vocab_size, int min_pair_freq,
                       const std::function<void(int32_t, int32_t)>& progress) {
   merges_.clear();
   rebuild_pieces();
   if (vocab_size <= kBaseVocab) return;
+  const std::string text = preprocess(raw_text);
 
   // 1) word frequencies
   std::unordered_map<std::string, int64_t> freq;
@@ -91,7 +113,7 @@ void Tokenizer::train(const std::string& text, int32_t vocab_size, int min_pair_
     wfreq.push_back(kv.second);
   }
 
-  // 2) pair statistics with an inverted index so merges are incremental
+  // 2) pair statistics with an inverted index so merges stay incremental
   std::unordered_map<uint64_t, int64_t> counts;
   std::unordered_map<uint64_t, std::unordered_set<int32_t>> where;
   auto touch = [&](int32_t wi, int64_t sign) {
@@ -114,7 +136,6 @@ void Tokenizer::train(const std::string& text, int32_t vocab_size, int min_pair_
 
   const int32_t target = vocab_size - kBaseVocab;
   for (int32_t step = 0; step < target; ++step) {
-    // best pair: highest count, deterministic tie-break
     uint64_t best = 0;
     int64_t best_c = 0;
     for (const auto& kv : counts) {
@@ -174,20 +195,20 @@ void Tokenizer::apply_merges(std::vector<int32_t>& ids) const {
   }
 }
 
-std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
+std::vector<int32_t> Tokenizer::encode(const std::string& raw) const {
+  const std::string text = preprocess(raw);
   std::vector<int32_t> out;
   out.reserve(text.size() / 3 + 8);
   std::unordered_map<std::string, std::vector<int32_t>> cache;
   size_t i = 0;
   const size_t n = text.size();
   while (i < n) {
-    // Inline detection of the literal special-token spellings.
     if (text[i] == '<' && i + 1 < n && text[i + 1] == '|') {
       bool matched = false;
-      for (int s = 0; s < kNumSpecial; ++s) {
-        const std::string& name = pieces_[static_cast<size_t>(s)];
+      for (int sp = 0; sp < kNumSpecial; ++sp) {
+        const std::string& name = pieces_[static_cast<size_t>(sp)];
         if (text.compare(i, name.size(), name) == 0) {
-          out.push_back(s);
+          out.push_back(sp);
           i += name.size();
           matched = true;
           break;
@@ -195,24 +216,8 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
       }
       if (matched) continue;
     }
-    // Otherwise consume one pre-token chunk.
-    size_t j = i;
-    if (text[j] == ' ' && j + 1 < n &&
-        char_class(static_cast<unsigned char>(text[j + 1])) != kSpace)
-      ++j;
-    const int c = char_class(static_cast<unsigned char>(text[j]));
-    if (c == kSpace)
-      while (j < n && char_class(static_cast<unsigned char>(text[j])) == kSpace &&
-             j - i < kMaxChunk)
-        ++j;
-    else
-      while (j < n && char_class(static_cast<unsigned char>(text[j])) == c &&
-             j - i < kMaxChunk) {
-        if (text[j] == '<' && j > i && j + 1 < n && text[j + 1] == '|') break;
-        ++j;
-      }
-    if (j == i) ++j;
-    const std::string chunk(text, i, j - i);
+    const size_t e = chunk_end(text, i);
+    const std::string chunk(text, i, e - i);
     auto it = cache.find(chunk);
     if (it == cache.end()) {
       std::vector<int32_t> ids;
@@ -223,9 +228,21 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
       it = cache.emplace(chunk, std::move(ids)).first;
     }
     out.insert(out.end(), it->second.begin(), it->second.end());
-    i = j;
+    i = e;
   }
   return out;
+}
+
+Tokenizer::FertilityReport Tokenizer::fertility(const std::string& raw) const {
+  const std::string text = preprocess(raw);
+  FertilityReport r;
+  r.bytes = text.size();
+  r.chars = utf8_length(text);
+  const std::vector<int32_t> ids = encode(raw);
+  r.tokens = ids.size();
+  for (int32_t id : ids)
+    if (id >= kFirstByte && id < kBaseVocab) ++r.single_byte_tokens;
+  return r;
 }
 
 std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
@@ -241,21 +258,20 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
 std::string Tokenizer::token_display(int32_t id) const {
   if (id < 0 || id >= static_cast<int32_t>(pieces_.size())) return "<?>";
   if (id < kNumSpecial) return pieces_[static_cast<size_t>(id)];
-  std::string s = pieces_[static_cast<size_t>(id)];
+  const std::string& s = pieces_[static_cast<size_t>(id)];
   std::string out;
-  for (unsigned char c : s) {
-    if (c == '\n')
-      out += "\\n";
-    else if (c == '\t')
-      out += "\\t";
-    else if (c == '\r')
-      out += "\\r";
-    else if (c == ' ')
-      out += "\xc2\xb7";  // middle dot for visible spaces
-    else if (c < 0x20)
-      out += '?';
-    else
-      out += static_cast<char>(c);
+  size_t i = 0;
+  while (i < s.size()) {
+    const size_t start = i;
+    const uint32_t cp = utf8_next(s, &i);
+    if (cp == '\n') out += "\\n";
+    else if (cp == '\t') out += "\\t";
+    else if (cp == '\r') out += "\\r";
+    else if (cp == ' ') out += "\xc2\xb7";       // visible space
+    else if (cp == 0x200C) out += "\xe2\x80\xa2";  // visible ZWNJ (bullet)
+    else if (cp >= 0xDC80 && cp <= 0xDCFF) out += '?';  // half a UTF-8 sequence
+    else if (cp < 0x20) out += '?';
+    else out.append(s, start, i - start);
   }
   return out;
 }
@@ -263,8 +279,9 @@ std::string Tokenizer::token_display(int32_t id) const {
 bool Tokenizer::save(const std::string& path) const {
   std::ofstream f(path, std::ios::binary);
   if (!f) return false;
-  f << "SLMTOK 1\n";
+  f << "SLMTOK 2\n";
   f << "specials " << kNumSpecial << "\n";
+  f << "normalize " << (normalize_ ? 1 : 0) << "\n";
   f << "merges " << merges_.size() << "\n";
   for (const auto& m : merges_) f << m.first << " " << m.second << "\n";
   return f.good();
@@ -276,14 +293,22 @@ bool Tokenizer::load(const std::string& path) {
   std::string magic;
   int version = 0;
   f >> magic >> version;
-  if (magic != "SLMTOK" || version != 1) return false;
+  if (magic != "SLMTOK" || (version != 1 && version != 2)) return false;
   std::string key;
   int32_t specials = 0;
   size_t nmerges = 0;
   f >> key >> specials;
   if (key != "specials" || specials != kNumSpecial) return false;
-  f >> key >> nmerges;
+  normalize_ = false;  // v1 files predate normalisation
+  f >> key;
+  if (key == "normalize") {
+    int flag = 0;
+    f >> flag;
+    normalize_ = flag != 0;
+    f >> key;
+  }
   if (key != "merges") return false;
+  f >> nmerges;
   merges_.clear();
   merges_.reserve(nmerges);
   for (size_t i = 0; i < nmerges; ++i) {

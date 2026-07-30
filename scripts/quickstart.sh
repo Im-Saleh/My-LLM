@@ -31,30 +31,36 @@ done
 [[ -x "$BIN" ]] || { echo "build first: ./build.sh"; exit 1; }
 mkdir -p "$RUN"
 
-CORPUS="$ROOT/data/sample_corpus.txt"
-if [[ ! -f "$CORPUS" ]]; then
-  echo "==> generating the sample corpus"
-  python3 "$ROOT/scripts/make_sample_data.py" "$CORPUS"
+# Trilingual corpus: Persian + English + Python.
+MIX="fa=$ROOT/data/fa.txt:0.40,en=$ROOT/data/en.txt:0.25,py=$ROOT/data/py.txt:0.35"
+if [[ ! -f "$ROOT/data/fa.txt" ]]; then
+  echo "==> generating the trilingual corpus (fa / en / py)"
+  python3 "$ROOT/scripts/make_trilingual_data.py" --out-dir "$ROOT/data"
 fi
 
-echo "==> 1/4 tokenizer"
-"$BIN" tokenizer --input "$CORPUS" --out "$RUN/tok.slmtok" --vocab "$VOCAB"
+echo "==> 1/4 tokenizer (weighted over the three languages)"
+"$BIN" tokenizer --mix "$MIX" --out "$RUN/tok.slmtok" --vocab "$VOCAB"
 
 echo "==> 2/4 base model ($STEPS steps, config $(basename "$CONFIG"))"
-"$BIN" pretrain --data "$CORPUS" --tokenizer "$RUN/tok.slmtok" --out "$RUN/base.slm" \
-  --config "$CONFIG" --steps "$STEPS" --save-every 100
+"$BIN" pretrain --mix "$MIX" --tokenizer "$RUN/tok.slmtok" --out "$RUN/base.slm" \
+  --config "$CONFIG" --steps "$STEPS" --save-every 200
 
-echo "==> 3/4 sanity check"
-"$BIN" eval --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --data "$CORPUS"
-"$BIN" chat --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" \
-  --prompt '<|user|>what is the capital of France?<|assistant|>' --max-new 32
+echo "==> 3/4 per language evaluation"
+"$BIN" eval --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --mix "$MIX"
+"$BIN" langcheck --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --mix "$MIX" --samples 8
+for p in '<|user|>پایتخت ژاپن کجاست؟<|assistant|>' \
+         '<|user|>what is the capital of France?<|assistant|>' \
+         '<|user|>write a python function that checks whether a number is prime<|assistant|>'; do
+  echo "--- $p"
+  "$BIN" chat --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --prompt "$p" --max-new 64 --temp 0.6
+done
 
 echo "==> 4/4 live self-training"
 if [[ "$GUI" == 1 ]]; then
-  "$BIN" dashboard --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --data "$CORPUS" \
-    --config "$CONFIG" --workdir "$RUN/session"
+  "$BIN" dashboard --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --mix "$MIX" \
+    --config "$CONFIG" --workdir "$RUN/session" --autopilot
 else
-  "$BIN" live --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --data "$CORPUS" \
+  "$BIN" live --ckpt "$RUN/base.slm" --tokenizer "$RUN/tok.slmtok" --mix "$MIX" \
     --config "$CONFIG" --workdir "$RUN/session" --autopilot --seconds "$SECONDS_LIVE" --threads 2
   echo
   echo "audit trail: $RUN/session/audit.jsonl"

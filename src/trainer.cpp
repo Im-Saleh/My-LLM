@@ -10,7 +10,7 @@ namespace slm {
 
 TrainerBase::TrainerBase(Source src, Coordinator* coord, Telemetry* tel,
                          const GPTConfig& mcfg, const TrainerConfig& tcfg,
-                         const Tokenizer* tok, const TokenDataset* corpus,
+                         const Tokenizer* tok, const MixtureDataset* corpus,
                          uint64_t seed)
     : src_(src),
       coord_(coord),
@@ -109,8 +109,12 @@ float TrainerBase::train_batches(const std::vector<Batch>& batches, int64_t* ste
 void TrainerBase::add_replay(std::vector<Batch>* batches, int64_t how_many) {
   if (!corpus_ || corpus_->empty() || how_many <= 0) return;
   const int64_t ctx = std::min<int64_t>(tcfg_.ctx, mcfg_.block_size);
-  for (int64_t i = 0; i < how_many; ++i)
-    batches->push_back(corpus_->sample_batch(tcfg_.batch, ctx, rng_));
+  const int n = corpus_->num_sources();
+  // At least one batch per language, then top up in round-robin order.
+  const int64_t rounds = std::max<int64_t>(1, (how_many + n - 1) / n);
+  for (int64_t r = 0; r < rounds; ++r)
+    for (int s = 0; s < n; ++s)
+      batches->push_back(corpus_->sample_batch_from(s, tcfg_.batch, ctx, rng_));
 }
 
 void TrainerBase::submit_delta(float loss_start, float loss_end, int64_t samples,

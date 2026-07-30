@@ -2,6 +2,8 @@
 #include "chat.h"
 
 #include <algorithm>
+
+#include "core/text.h"
 #include <chrono>
 
 namespace slm {
@@ -72,7 +74,7 @@ void ChatEngine::rate(size_t index, float score) {
   if (hub_) hub_->push_rating(s);
   if (tel_)
     tel_->log("info", "user", "rated a response",
-              {{"score", std::to_string(score)}, {"prompt", s.prompt.substr(0, 80)}});
+              {{"score", std::to_string(score)}, {"prompt", utf8_truncate(s.prompt, 80)}});
 }
 
 void ChatEngine::loop() {

@@ -99,6 +99,7 @@ struct CoordinatorConfig {
   float global_trust_ratio = 0.02f;
   float priority[kNumSources] = {1.0f, 0.6f, 1.4f};
   // acceptance
+  bool per_language_gate = true;       // every language must pass, not just the mean
   float accept_tolerance = 0.003f;     // allowed step-local hold-out increase
   // Ratchet: the model may never end up worse than the best state seen this
   // session plus this budget.  Without it, a long series of "only 0.002 worse"
@@ -129,8 +130,11 @@ struct CoordinatorConfig {
 };
 
 struct EvalResult {
-  float loss = 0.0f;
-  float entropy = 0.0f;
+  float loss = 0.0f;     // mean over every hold-out batch
+  float entropy = 0.0f;  // mean predictive entropy (collapse detector)
+  bool present[kNumLangs] = {};
+  float lang_loss[kNumLangs] = {};
+  float lang_entropy[kNumLangs] = {};
 };
 
 // Thread-safe RCU-style holder for the published weights.
@@ -149,7 +153,7 @@ class WeightRegistry {
 class Coordinator {
  public:
   Coordinator(const GPTConfig& mcfg, ParamStorePtr initial,
-              std::vector<std::string> merge_space, const TokenDataset* data,
+              std::vector<std::string> merge_space, const MixtureDataset* data,
               Telemetry* tel, const CoordinatorConfig& cfg, std::string workdir);
   ~Coordinator();
 
@@ -186,7 +190,7 @@ class Coordinator {
   GPTConfig mcfg_;
   CoordinatorConfig cfg_;
   Telemetry* tel_;
-  const TokenDataset* data_;
+  const MixtureDataset* data_;
   std::string workdir_;
 
   WeightRegistry weights_;
@@ -207,7 +211,9 @@ class Coordinator {
   CoordinatorStats st_;
   EvalResult base_eval_;
   float session_entropy_ = 0.0f;
+  float session_lang_entropy_[kNumLangs] = {};
   float best_val_ = 1e30f;
+  float best_lang_[kNumLangs] = {};
   ParamStorePtr best_snapshot_;
   std::deque<ParamStorePtr> mem_backups_;
   std::deque<std::string> disk_backups_;

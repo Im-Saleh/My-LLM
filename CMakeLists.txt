@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.16)
-project(slm VERSION 0.1.0 LANGUAGES CXX)
+project(slm VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,7 @@ set(SLM_CORE_SOURCES
   src/core/params.cpp
   src/core/serialize.cpp
   src/core/tensor_common.cpp
+  src/core/text.cpp
   src/model.cpp
   src/tokenizer.cpp
 )
@@ -61,6 +62,7 @@ endif()
 # ---------------------------------------------------- self-training executable
 add_library(slm_live STATIC
   src/app.cpp
+  src/gui_text.cpp
   src/chat.cpp
   src/coordinator.cpp
   src/gui.cpp
@@ -122,6 +124,25 @@ if(SLM_WITH_GUI)
 
   target_link_libraries(slm_live PUBLIC imgui)
   target_compile_definitions(slm_live PUBLIC SLM_WITH_GUI=1)
+
+  # Correct Persian/Arabic rendering needs real text shaping.  Without these two
+  # libraries the dashboard still builds and runs, it just cannot draw connected
+  # Persian script (the terminal dashboard is the fallback for that).
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(FREETYPE2 QUIET freetype2)
+    pkg_check_modules(HARFBUZZ QUIET harfbuzz)
+  endif()
+  if(FREETYPE2_FOUND AND HARFBUZZ_FOUND)
+    message(STATUS "text shaping: freetype ${FREETYPE2_VERSION} + harfbuzz ${HARFBUZZ_VERSION}")
+    target_include_directories(slm_live PUBLIC ${FREETYPE2_INCLUDE_DIRS} ${HARFBUZZ_INCLUDE_DIRS})
+    target_link_libraries(slm_live PUBLIC ${FREETYPE2_LIBRARIES} ${HARFBUZZ_LIBRARIES})
+    target_link_directories(slm_live PUBLIC ${FREETYPE2_LIBRARY_DIRS} ${HARFBUZZ_LIBRARY_DIRS})
+    target_compile_definitions(slm_live PUBLIC SLM_WITH_TEXT_SHAPING=1)
+  else()
+    message(WARNING "freetype2/harfbuzz not found - the GUI will not shape Persian text\n"
+                    "   install: libfreetype-dev libharfbuzz-dev (Debian) / freetype-devel harfbuzz-devel (Fedora)")
+  endif()
 endif()
 
 add_executable(slm src/main.cpp)
@@ -130,8 +151,11 @@ target_link_libraries(slm PRIVATE slm_live)
 if(SLM_BUILD_TESTS)
   add_executable(slm_gradcheck src/tests/gradcheck.cpp)
   target_link_libraries(slm_gradcheck PRIVATE slm_core)
+  add_executable(slm_texttest src/tests/text_test.cpp)
+  target_link_libraries(slm_texttest PRIVATE slm_core)
   enable_testing()
   add_test(NAME gradcheck COMMAND slm_gradcheck)
+  add_test(NAME text COMMAND slm_texttest)
 endif()
 
 # --------------------------------------------------------------------- install

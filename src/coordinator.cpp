@@ -72,6 +72,7 @@ CoordinatorConfig CoordinatorConfig::from_config(const Config& c) {
   k.priority[0] = static_cast<float>(c.get_num("coord.priority.continual", k.priority[0]));
   k.priority[1] = static_cast<float>(c.get_num("coord.priority.selfgen", k.priority[1]));
   k.priority[2] = static_cast<float>(c.get_num("coord.priority.feedback", k.priority[2]));
+  k.per_language_gate = c.get_bool("coord.per_language_gate", k.per_language_gate);
   k.accept_tolerance =
       static_cast<float>(c.get_num("coord.accept_tolerance", k.accept_tolerance));
   k.regression_budget =
@@ -113,7 +114,7 @@ ParamStorePtr WeightRegistry::current(uint64_t* version) const {
 // ================================================================ Coordinator
 Coordinator::Coordinator(const GPTConfig& mcfg, ParamStorePtr initial,
                          std::vector<std::string> merge_space,
-                         const TokenDataset* data, Telemetry* tel,
+                         const MixtureDataset* data, Telemetry* tel,
                          const CoordinatorConfig& cfg, std::string workdir)
     : mcfg_(mcfg), cfg_(cfg), tel_(tel), data_(data), workdir_(std::move(workdir)) {
   weights_.publish(initial);
@@ -127,10 +128,24 @@ Coordinator::Coordinator(const GPTConfig& mcfg, ParamStorePtr initial,
   const int64_t ctx = cfg_.holdout_ctx > 0
                           ? std::min<int64_t>(cfg_.holdout_ctx, mcfg_.block_size)
                           : mcfg_.block_size;
-  if (data_) holdout_ = data_->holdout_batches(cfg_.holdout_batch, ctx, cfg_.holdout_batches);
+  // One hold-out slice per source, tagged with its language.
+  if (data_)
+    for (int s = 0; s < data_->num_sources(); ++s) {
+      std::vector<Batch> b =
+          data_->holdout_batches(s, cfg_.holdout_batch, ctx, cfg_.holdout_batches);
+      holdout_.insert(holdout_.end(), b.begin(), b.end());
+    }
 
   base_eval_ = evaluate(*initial);
   session_entropy_ = base_eval_.entropy;
+  for (int l = 0; l < kNumLangs; ++l) {
+    session_lang_entropy_[l] = base_eval_.lang_entropy[l];
+    best_lang_[l] = base_eval_.present[l] ? base_eval_.lang_loss[l] : 1e30f;
+    st_.lang_present[l] = base_eval_.present[l];
+    st_.lang_val[l] = base_eval_.lang_loss[l];
+    st_.lang_best[l] = base_eval_.lang_loss[l];
+    st_.lang_entropy[l] = base_eval_.lang_entropy[l];
+  }
   best_val_ = base_eval_.loss;
   best_snapshot_ = initial;
   st_.baseline_val = base_eval_.loss;
@@ -152,7 +167,17 @@ Coordinator::Coordinator(const GPTConfig& mcfg, ParamStorePtr initial,
                   std::to_string(flat_.total) + " scalars",
               {{"holdout_batches", std::to_string(holdout_.size())},
                {"baseline_loss", fmt(base_eval_.loss)},
-               {"baseline_entropy", fmt(base_eval_.entropy)}});
+               {"baseline_entropy", fmt(base_eval_.entropy)},
+               {"languages", [&] {
+                  std::string t;
+                  for (int l = 0; l < kNumLangs; ++l)
+                    if (base_eval_.present[l]) {
+                      if (!t.empty()) t += ",";
+                      t += std::string(lang_code(static_cast<Lang>(l))) + ":" +
+                           fmt(base_eval_.lang_loss[l], 3);
+                    }
+                  return t;
+                }()}});
   }
 }
 
@@ -222,14 +247,26 @@ EvalResult Coordinator::evaluate(const ParamStore& candidate) {
   if (holdout_.empty()) return EvalResult{};
   eval_model_->load_params(candidate);
   double loss = 0.0, ent = 0.0;
+  double lang_loss[kNumLangs] = {}, lang_ent[kNumLangs] = {};
+  int lang_n[kNumLangs] = {};
   for (const Batch& b : holdout_) {
     const EvalResult r = eval_batch(*eval_model_, b);
     loss += r.loss;
     ent += r.entropy;
+    const int li = static_cast<int>(b.lang);
+    lang_loss[li] += r.loss;
+    lang_ent[li] += r.entropy;
+    ++lang_n[li];
   }
   EvalResult r;
   r.loss = static_cast<float>(loss / static_cast<double>(holdout_.size()));
   r.entropy = static_cast<float>(ent / static_cast<double>(holdout_.size()));
+  for (int l = 0; l < kNumLangs; ++l) {
+    if (!lang_n[l]) continue;
+    r.present[l] = true;
+    r.lang_loss[l] = static_cast<float>(lang_loss[l] / lang_n[l]);
+    r.lang_entropy[l] = static_cast<float>(lang_ent[l] / lang_n[l]);
+  }
   return r;
 }
 
@@ -515,6 +552,16 @@ void Coordinator::round() {
   // two-sided gate: local tolerance *and* a session ratchet against the best
   const float gate = std::min(before.loss + cfg_.accept_tolerance,
                               best_val_ + cfg_.regression_budget);
+  // ... and the same test per language, so an update that trades Python away
+  // for Persian never lands.
+  float lang_gate[kNumLangs];
+  for (int l = 0; l < kNumLangs; ++l) {
+    lang_gate[l] = before.present[l]
+                       ? std::min(before.lang_loss[l] + cfg_.accept_tolerance,
+                                  best_lang_[l] + cfg_.regression_budget)
+                       : 1e30f;
+    st_.lang_gate[l] = lang_gate[l];
+  }
   bool accepted = false;
   std::shared_ptr<ParamStore> cand_store;
   float used_alpha = 0.0f;
@@ -545,6 +592,27 @@ void Coordinator::round() {
     after = evaluate(*cand_store);
     const bool loss_ok = after.loss <= gate;
     const bool ent_ok = after.entropy >= ent_floor;
+    int bad_lang = -1;
+    if (cfg_.per_language_gate)
+      for (int l = 0; l < kNumLangs; ++l) {
+        if (!before.present[l] || !after.present[l]) continue;
+        if (after.lang_loss[l] > lang_gate[l]) {
+          bad_lang = l;
+          break;
+        }
+        if (session_lang_entropy_[l] > 0.0f &&
+            after.lang_entropy[l] < cfg_.entropy_floor_ratio * session_lang_entropy_[l]) {
+          bad_lang = l;
+          break;
+        }
+      }
+    if (bad_lang >= 0) {
+      const Lang bl = static_cast<Lang>(bad_lang);
+      reason = std::string("language regression on ") + lang_name(bl) + ": " +
+               fmt(before.lang_loss[bad_lang]) + " -> " + fmt(after.lang_loss[bad_lang]) +
+               " > gate " + fmt(lang_gate[bad_lang]);
+      continue;
+    }
     if (loss_ok && ent_ok) {
       accepted = true;
       used_alpha = alpha;
@@ -576,6 +644,11 @@ void Coordinator::round() {
   fields.emplace_back("rel_step", fmt(rel * rate_scale, 6));
   fields.emplace_back("rate_left", fmt(rate_bucket_, 4));
   fields.emplace_back("gate", fmt(gate));
+  for (int l = 0; l < kNumLangs; ++l)
+    if (before.present[l])
+      fields.emplace_back(std::string("holdout_") + lang_code(static_cast<Lang>(l)),
+                          fmt(before.lang_loss[l]) + "->" +
+                              (after.present[l] ? fmt(after.lang_loss[l]) : std::string("?")));
 
   if (accepted && committed) {
     const double consumed = rel * static_cast<double>(used_alpha) * rate_scale;
@@ -625,6 +698,14 @@ void Coordinator::round() {
       best_snapshot_ = committed;
       st_.best_val = best_val_;
     }
+    for (int l = 0; l < kNumLangs; ++l) {
+      if (!after.present[l]) continue;
+      st_.lang_present[l] = true;
+      st_.lang_val[l] = after.lang_loss[l];
+      st_.lang_entropy[l] = after.lang_entropy[l];
+      if (after.lang_loss[l] < best_lang_[l]) best_lang_[l] = after.lang_loss[l];
+      st_.lang_best[l] = best_lang_[l];
+    }
     mem_backups_.push_back(committed);
     while (static_cast<int>(mem_backups_.size()) > cfg_.max_memory_backups)
       mem_backups_.pop_front();
@@ -655,6 +736,9 @@ void Coordinator::round() {
     tel_->set_coord(stats());
     if (accepted) {
       tel_->push_loss(Stream::kHoldout, after.loss, round_no);
+      for (int l = 0; l < kNumLangs; ++l)
+        if (after.present[l])
+          tel_->push_loss(stream_for_lang(static_cast<Lang>(l)), after.lang_loss[l], round_no);
       tel_->log("accept", "coordinator", decision, fields);
     } else {
       tel_->log("reject", "coordinator", decision, fields);

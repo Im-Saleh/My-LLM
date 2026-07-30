@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/text.h"
+
 namespace slm {
 
 class Tokenizer {
@@ -31,6 +33,13 @@ class Tokenizer {
   static constexpr int32_t kBaseVocab = kNumSpecial + 256;
 
   Tokenizer();
+
+  // Persian/multilingual normalisation applied to *every* string before it is
+  // encoded, and to the corpus before merges are learned.  Persisting the flag
+  // inside the tokenizer file is what keeps training and inference consistent.
+  void set_normalize(bool on) { normalize_ = on; }
+  bool normalize() const { return normalize_; }
+  std::string preprocess(const std::string& text) const;
 
   // Learn merges from `text`. Progress callback receives (done, total).
   void train(const std::string& text, int32_t vocab_size, int min_pair_freq = 2,
@@ -50,7 +59,23 @@ class Tokenizer {
   bool load(const std::string& path);
 
   // Split text the way training does (exposed for tests/tools).
+  // Code-point aware: Persian punctuation (، ؛ ؟ « ») never glues to a word,
+  // ZWNJ stays *inside* a word, digits are emitted one by one and a run of
+  // spaces/newlines (Python indentation) is one piece.
   static std::vector<std::string> pretokenize(const std::string& text);
+
+  // Per-language statistics for a corpus: tokens, bytes/token, and the share
+  // of tokens that are a single byte (the symptom of a vocabulary that does not
+  // cover a language).
+  struct FertilityReport {
+    size_t bytes = 0, tokens = 0, single_byte_tokens = 0, chars = 0;
+    double bytes_per_token() const { return tokens ? static_cast<double>(bytes) / tokens : 0.0; }
+    double chars_per_token() const { return tokens ? static_cast<double>(chars) / tokens : 0.0; }
+    double single_byte_share() const {
+      return tokens ? static_cast<double>(single_byte_tokens) / tokens : 0.0;
+    }
+  };
+  FertilityReport fertility(const std::string& text) const;
 
  private:
   void rebuild_pieces();
@@ -66,6 +91,7 @@ class Tokenizer {
            static_cast<uint32_t>(b);
   }
 
+  bool normalize_ = true;
   std::vector<std::pair<int32_t, int32_t>> merges_;  // id kBaseVocab+i
   std::unordered_map<uint64_t, int32_t> rank_;       // pair -> merge index
   std::vector<std::string> pieces_;                  // id -> byte string

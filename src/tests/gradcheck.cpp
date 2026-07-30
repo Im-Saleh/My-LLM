@@ -163,6 +163,24 @@ void test_ops() {
   check_grad("softmax_last", {rnd({3, 7}, 16)}, [](std::vector<Tensor>& v) {
     return to_scalar(v[0].softmax_last(), 22);
   });
+  check_grad("silu", {rnd({4, 6}, 60)}, [](std::vector<Tensor>& v) {
+    return to_scalar(v[0].silu(), 61);
+  });
+  check_grad("rmsnorm", {rnd({4, 8}, 62), rnd({8}, 63)}, [](std::vector<Tensor>& v) {
+    return to_scalar(v[0].rmsnorm(v[1], 1e-5f), 64);
+  });
+  check_grad("rope", {rnd({2, 2, 5, 8}, 65)}, [](std::vector<Tensor>& v) {
+    return to_scalar(rope(v[0], 3, 10000.0f), 66);
+  });
+  check_grad("repeat_kv (GQA)", {rnd({2, 2, 4, 6}, 67)}, [](std::vector<Tensor>& v) {
+    return to_scalar(repeat_kv(v[0], 3), 68);
+  });
+  check_grad("swiglu chain", {rnd({3, 6}, 69), rnd({6, 8}, 70), rnd({6, 8}, 71)},
+             [](std::vector<Tensor>& v) {
+               Tensor gate = linear(v[0], v[1], nullptr).silu();
+               Tensor up = linear(v[0], v[2], nullptr);
+               return to_scalar(gate.mul(up), 72);
+             });
   check_grad("layernorm", {rnd({4, 8}, 17), rnd({8}, 18), rnd({8}, 19)},
              [](std::vector<Tensor>& v) {
                return to_scalar(v[0].layernorm(v[1], v[2], 1e-5f), 23);

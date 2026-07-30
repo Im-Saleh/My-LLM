@@ -988,6 +988,175 @@ Tensor logsigmoid(const Tensor& x) {
   return Tensor(out);
 }
 
+
+Tensor Tensor::silu() const {
+  SLM_CHECK(impl_ != nullptr, "silu on undefined tensor");
+  auto out = make_impl(impl_->shape);
+  const float* x = impl_->data();
+  float* y = out->data();
+  const int64_t n = out->n;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && n > 4096)
+#endif
+  for (int64_t i = 0; i < n; ++i) y[i] = x[i] / (1.0f + std::exp(-x[i]));
+  if (tracking({&impl_})) {
+    ImplPtr in = impl_;
+    link(out, {in}, "silu", [in](TensorImpl& o) {
+      const float* x2 = in->data();
+      const float* go = o.gconst();
+      float* g = in->g();
+      const int64_t m = o.n;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && m > 4096)
+#endif
+      for (int64_t i = 0; i < m; ++i) {
+        const float sig = 1.0f / (1.0f + std::exp(-x2[i]));
+        g[i] += go[i] * sig * (1.0f + x2[i] * (1.0f - sig));
+      }
+    });
+  }
+  return Tensor(out);
+}
+
+Tensor Tensor::rmsnorm(const Tensor& gain, float eps) const {
+  SLM_CHECK(impl_ && gain.impl_, "rmsnorm on undefined tensor");
+  const int64_t C = impl_->shape.back();
+  SLM_CHECK(gain.impl_->n == C, "rmsnorm: gain size");
+  const int64_t rows = impl_->n / C;
+  auto out = make_impl(impl_->shape);
+  auto rstd = std::make_shared<std::vector<float>>(static_cast<size_t>(rows));
+  const float* x = impl_->data();
+  const float* gn = gain.impl_->data();
+  float* y = out->data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && rows > 8)
+#endif
+  for (int64_t r = 0; r < rows; ++r) {
+    const float* xr = x + r * C;
+    double ss = 0.0;
+    for (int64_t j = 0; j < C; ++j) ss += static_cast<double>(xr[j]) * xr[j];
+    const float rs = 1.0f / std::sqrt(static_cast<float>(ss / static_cast<double>(C)) + eps);
+    (*rstd)[static_cast<size_t>(r)] = rs;
+    float* yr = y + r * C;
+    for (int64_t j = 0; j < C; ++j) yr[j] = xr[j] * rs * gn[j];
+  }
+  if (tracking({&impl_, &gain.impl_})) {
+    ImplPtr xi = impl_, gi = gain.impl_;
+    link(out, {xi, gi}, "rmsnorm", [xi, gi, rstd, rows, C](TensorImpl& o) {
+      const float* go = o.gconst();
+      const float* x2 = xi->data();
+      const float* gn2 = gi->data();
+      float* gx = xi->requires_grad ? xi->g() : nullptr;
+      float* gg = gi->requires_grad ? gi->g() : nullptr;
+      const float invC = 1.0f / static_cast<float>(C);
+      for (int64_t r = 0; r < rows; ++r) {
+        const float rs = (*rstd)[static_cast<size_t>(r)];
+        const float* xr = x2 + r * C;
+        const float* gr = go + r * C;
+        double dot = 0.0;  // sum_i dy_i * g_i * x_i
+        for (int64_t j = 0; j < C; ++j) dot += static_cast<double>(gr[j]) * gn2[j] * xr[j];
+        if (gg)
+          for (int64_t j = 0; j < C; ++j) gg[j] += gr[j] * xr[j] * rs;
+        if (gx) {
+          float* gxr = gx + r * C;
+          const float k = static_cast<float>(dot) * rs * rs * rs * invC;
+          for (int64_t j = 0; j < C; ++j) gxr[j] += rs * gn2[j] * gr[j] - xr[j] * k;
+        }
+      }
+    });
+  }
+  return Tensor(out);
+}
+
+Tensor rope(const Tensor& x, int64_t pos_offset, float theta) {
+  const ImplPtr xi = x.impl();
+  SLM_CHECK(xi && xi->shape.size() == 4, "rope: expected [B,H,T,D]");
+  const int64_t B = xi->shape[0], H = xi->shape[1], T = xi->shape[2], D = xi->shape[3];
+  SLM_CHECK(D % 2 == 0, "rope: head dim must be even");
+  auto out = make_impl(xi->shape);
+  const int64_t half = D / 2;
+  // cos/sin table for this call (T x half), shared with the backward pass
+  auto tab = std::make_shared<std::vector<float>>(static_cast<size_t>(2 * T * half));
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t i = 0; i < half; ++i) {
+      const float freq =
+          1.0f / std::pow(theta, static_cast<float>(2 * i) / static_cast<float>(D));
+      const float ang = static_cast<float>(pos_offset + t) * freq;
+      (*tab)[static_cast<size_t>((t * half + i) * 2 + 0)] = std::cos(ang);
+      (*tab)[static_cast<size_t>((t * half + i) * 2 + 1)] = std::sin(ang);
+    }
+  const float* src = xi->data();
+  float* dst = out->data();
+  const int64_t rows = B * H;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && rows > 4)
+#endif
+  for (int64_t r = 0; r < rows; ++r)
+    for (int64_t t = 0; t < T; ++t) {
+      const float* s = src + (r * T + t) * D;
+      float* d = dst + (r * T + t) * D;
+      for (int64_t i = 0; i < half; ++i) {
+        const float c = (*tab)[static_cast<size_t>((t * half + i) * 2 + 0)];
+        const float sn = (*tab)[static_cast<size_t>((t * half + i) * 2 + 1)];
+        const float a = s[2 * i], b = s[2 * i + 1];
+        d[2 * i] = a * c - b * sn;
+        d[2 * i + 1] = a * sn + b * c;
+      }
+    }
+  if (t_grad_enabled && xi->requires_grad) {
+    link(out, {xi}, "rope", [xi, tab, rows, T, D, half](TensorImpl& o) {
+      const float* go = o.gconst();
+      float* g = xi->g();
+      for (int64_t r = 0; r < rows; ++r)
+        for (int64_t t = 0; t < T; ++t) {
+          const float* gr = go + (r * T + t) * D;
+          float* gi = g + (r * T + t) * D;
+          for (int64_t i = 0; i < half; ++i) {
+            const float c = (*tab)[static_cast<size_t>((t * half + i) * 2 + 0)];
+            const float sn = (*tab)[static_cast<size_t>((t * half + i) * 2 + 1)];
+            const float ga = gr[2 * i], gb = gr[2 * i + 1];
+            gi[2 * i] += ga * c + gb * sn;       // rotation by -angle
+            gi[2 * i + 1] += -ga * sn + gb * c;
+          }
+        }
+    });
+  }
+  return Tensor(out);
+}
+
+Tensor repeat_kv(const Tensor& x, int64_t repeat) {
+  const ImplPtr xi = x.impl();
+  SLM_CHECK(xi && xi->shape.size() == 4, "repeat_kv: expected [B,Hkv,T,D]");
+  if (repeat == 1) return x;
+  SLM_CHECK(repeat > 1, "repeat_kv: repeat must be >= 1");
+  const int64_t B = xi->shape[0], Hkv = xi->shape[1], T = xi->shape[2], D = xi->shape[3];
+  auto out = make_impl({B, Hkv * repeat, T, D});
+  const int64_t plane = T * D;
+  const float* src = xi->data();
+  float* dst = out->data();
+  for (int64_t b = 0; b < B; ++b)
+    for (int64_t h = 0; h < Hkv; ++h)
+      for (int64_t k = 0; k < repeat; ++k)
+        std::memcpy(dst + ((b * Hkv * repeat) + h * repeat + k) * plane,
+                    src + (b * Hkv + h) * plane,
+                    sizeof(float) * static_cast<size_t>(plane));
+  if (t_grad_enabled && xi->requires_grad) {
+    link(out, {xi}, "repeat_kv", [xi, B, Hkv, repeat, plane](TensorImpl& o) {
+      const float* go = o.gconst();
+      float* g = xi->g();
+      for (int64_t b = 0; b < B; ++b)
+        for (int64_t h = 0; h < Hkv; ++h) {
+          float* gi = g + (b * Hkv + h) * plane;
+          for (int64_t k = 0; k < repeat; ++k) {
+            const float* gr = go + ((b * Hkv * repeat) + h * repeat + k) * plane;
+            for (int64_t i = 0; i < plane; ++i) gi[i] += gr[i];
+          }
+        }
+    });
+  }
+  return Tensor(out);
+}
+
 // =========================================================================
 // Gradient checkpointing
 // =========================================================================

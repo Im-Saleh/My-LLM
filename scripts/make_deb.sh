@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
-VERSION="0.1.0"
+VERSION="0.2.0"
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64) ARCH=amd64 ;;

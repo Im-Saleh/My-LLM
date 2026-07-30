@@ -90,8 +90,11 @@ class Tensor {
   Tensor add_bias(const Tensor& b) const;  // [..., C] + [C]
   Tensor matmul(const Tensor& o) const;    // batched over leading dims
   Tensor gelu() const;
+  Tensor silu() const;  // x * sigmoid(x), the SwiGLU activation
   Tensor softmax_last() const;
   Tensor layernorm(const Tensor& gain, const Tensor& bias, float eps) const;
+  // RMSNorm: x / sqrt(mean(x^2) + eps) * gain   (no mean subtraction, no bias)
+  Tensor rmsnorm(const Tensor& gain, float eps) const;
   Tensor causal_mask() const;  // [..., T, T]: j > i -> -inf
   Tensor sum_all() const;
   Tensor mean_all() const;
@@ -126,6 +129,13 @@ Tensor seq_logprob(const Tensor& logits, const std::vector<int32_t>& targets,
                    int32_t ignore_index);
 
 Tensor logsigmoid(const Tensor& x);
+
+// Rotary position embedding on [B, H, T, D] (D must be even).  `pos_offset`
+// makes it work with a KV cache: the query of step t is rotated by t, not by 0.
+Tensor rope(const Tensor& x, int64_t pos_offset, float theta);
+
+// Grouped-query attention: [B, H_kv, T, D] -> [B, H_kv * repeat, T, D]
+Tensor repeat_kv(const Tensor& x, int64_t repeat);
 
 // Gradient checkpointing: fn is run without a graph during forward and
 // recomputed with a graph during backward. Parameter gradients used inside fn

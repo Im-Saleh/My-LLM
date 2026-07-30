@@ -1,91 +1,100 @@
-# slm — یک Small Language Model در C++ با خودآموزی ترکیبی و داشبورد زنده
+# slm — یک Small Language Model در C++ برای **فارسی، انگلیسی و پایتون**
 
-یک ترنسفورمر decoder-only که کاملاً در C++17 نوشته شده، همراه با:
+یک ترنسفورمر decoder-only که کاملاً در C++17 نوشته شده، با پشتیبانی کامل فارسی
+(از توکنایزر تا رندر RTL در GUI)، معماری امروزی (RMSNorm + RoPE + SwiGLU + GQA)،
+و یک زیرسیستم خودآموزی سه‌گانه با coordinator که هر آپدیت را **جدا برای هر زبان**
+اعتبارسنجی می‌کند.
 
-* **موتور تنسور و autograd اختصاصی** (بدون هیچ وابستگی) + بکند اختیاری **libtorch** با همان API
-* **داشبورد زنده‌ی Dear ImGui**: نمودار loss سه pipeline، نقشه‌ی حرارتی توجه، توزیع توکن بعدی،
-  کنترل هر ترد، و دکمه‌ی **Emergency Stop** سراسری
-* **سه مکانیزم خودآموزی هم‌زمان** (یادگیری مداوم، داده‌ی خودتولید، بازخورد انسانی/DPO) که
-  آپدیت‌هایشان توسط یک **coordinator** ادغام و *قبل از اعمال* روی داده‌ی holdout اعتبارسنجی می‌شود
-* **لاگ حسابرسی کامل** (`audit.jsonl`) از هر تصمیم خودآموزی، و بسته‌ی نصبی `.deb`
+![داشبورد](docs/img/dashboard-fa.png)
 
-![داشبورد](docs/img/dashboard.png)
+* **موتور تنسور و autograd اختصاصی** (بدون هیچ وابستگی) + بکند اختیاری **libtorch**
+  با همان API — ۳۱/۳۱ تست عددی گرادیان
+* **فارسی درست، از پایه**: نیم‌فاصله، اعراب، حروف عربی/فارسی، شکل‌های نمایشی،
+  ارقام، علائم نگارشی، bidi — همه نرمال‌سازی و تست شده (۴۲ تست)
+* **رندر واقعی فارسی در GUI** با HarfBuzz + FreeType (حروف چسبان + RTL + fallback لاتین)
+* **سه مکانیزم خودآموزی هم‌زمان** (یادگیری مداوم، داده‌ی خودتولید، بازخورد DPO) با
+  **معیار کیفیت جدا برای هر زبان** و **گیت ضدفراموشی per-language**
+* **ارزیابی چندزبانه**: loss/ppl/**bits-per-char** جدا برای هر زبان + سنجش تداخل زبانی
+* بسته‌ی `.deb`، اسکریپت بیلد، و مدل آموزش‌دیده‌ی حاضر در مخزن
 
 ---
 
-## نصب و اجرا در یک نگاه
+## نصب و اجرا
 
 ```bash
-# ۱) کلون + بیلد + تست
-git clone https://github.com/Im-Saleh/My-LLM.git
-cd My-LLM
-sudo ./scripts/install_deps.sh          # کامپایلر، cmake، OpenGL/X11 (برای GUI)
-./build.sh --run-tests                  # → build/slm  و  build/slm_gradcheck
-
-# ۲) داده + توکنایزر + مدل پایه + داشبورد، همه با یک اسکریپت
-./scripts/quickstart.sh --config configs/slm-demo.conf --steps 500 --gui
+git clone https://github.com/Im-Saleh/My-LLM.git && cd My-LLM
+sudo ./scripts/install_deps.sh          # کامپایلر، cmake، OpenGL/X11، freetype/harfbuzz، فونت فارسی
+./build.sh --run-tests                  # → build/slm  (+ ۳۱ تست گرادیان + ۴۲ تست متن)
 ```
 
 ### مدل آماده (بدون آموزش)
 
-یک چک‌پوینت آموزش‌دیده‌ی fp16 در مخزن هست، پس بلافاصله بعد از بیلد قابل استفاده است:
-
 ```bash
-build/slm chat      --ckpt models/demo-6m.slm --tokenizer models/demo-6m.slmtok
-build/slm dashboard --ckpt models/demo-6m.slm --tokenizer models/demo-6m.slmtok \
-                    --data data/sample_corpus.txt --config configs/slm-demo.conf
-#           (اول کورپوس را بساز: python3 scripts/make_sample_data.py data/sample_corpus.txt)
+build/slm chat --ckpt models/demo-tri.slm --tokenizer models/demo-tri.slmtok
 ```
 
-`models/demo-6m.slm` = ۶.۳۸M پارامتر، fp16 (۱۲.۲MB، خطای RMS نسبت به fp32 فقط ۰.۰۱۷٪،
-همان `loss 0.3524`).
+```
+you> پایتخت ژاپن کجاست؟
+slm> پایتخت ژاپن شهر توکیو است.
 
-اگر ترجیح می‌دهی مرحله‌به‌مرحله:
+you> عنکبوت چند پا دارد؟
+slm> عنکبوت هشت پا دارد.
+
+you> نیم‌فاصله چیست؟
+slm> نیم‌فاصله فاصله‌ی مجازی است که دو بخش یک کلمه را جدا می‌کند بدون آنکه فاصله‌ی کامل بگذارد.
+
+you> یک تابع پایتون بنویس که عدد فیبوناچی n-ام را حساب کند
+slm> ```python
+     def fib(n):
+         """Return the n-th Fibonacci number iteratively."""
+         a, b = 0, 1
+         for _ in range(n):
+             a, b = b, a + b
+         return a
+     ```
+```
+
+### همه‌ی مسیر، با یک اسکریپت
 
 ```bash
-python3 scripts/make_sample_data.py data/sample_corpus.txt
-build/slm tokenizer --input data/sample_corpus.txt --out run/tok.slmtok --vocab 2048
-build/slm pretrain  --data data/sample_corpus.txt --tokenizer run/tok.slmtok \
-                    --out run/base.slm --config configs/slm-demo.conf --steps 1400 --batch 16
-build/slm dashboard --ckpt run/base.slm --tokenizer run/tok.slmtok \
-                    --data data/sample_corpus.txt --config configs/slm-demo.conf
-# بدون نمایشگر (SSH / سرور) همان چیز در ترمینال:
-build/slm live      --ckpt run/base.slm --tokenizer run/tok.slmtok \
-                    --data data/sample_corpus.txt --config configs/slm-demo.conf --autopilot
+./scripts/quickstart.sh --config configs/slm-demo.conf --steps 1800 --gui
+```
+
+یا مرحله‌به‌مرحله:
+
+```bash
+python3 scripts/make_trilingual_data.py                 # data/{fa,en,py}.txt
+MIX="fa=data/fa.txt:0.40,en=data/en.txt:0.25,py=data/py.txt:0.35"
+
+build/slm tokenizer --mix "$MIX" --out run/tok.slmtok --vocab 6144
+build/slm pretrain  --mix "$MIX" --tokenizer run/tok.slmtok --out run/base.slm \
+                    --config configs/slm-demo.conf --steps 1800 --batch 8
+build/slm eval      --mix "$MIX" --ckpt run/base.slm --tokenizer run/tok.slmtok
+build/slm langcheck --mix "$MIX" --ckpt run/base.slm --tokenizer run/tok.slmtok
+build/slm dashboard --mix "$MIX" --ckpt run/base.slm --tokenizer run/tok.slmtok \
+                    --config configs/slm-demo.conf --autopilot
+build/slm live      ...      # همان، با داشبورد ترمینالی (بدون نمایشگر)
 ```
 
 ### بسته‌ی `.deb`
 
 ```bash
-./build.sh --deb                        # → dist/slm_0.1.0_amd64.deb
-sudo apt install ./dist/slm_0.1.0_amd64.deb
-slm info
+./build.sh --deb                        # → dist/slm_0.2.0_amd64.deb
+sudo apt install ./dist/slm_0.2.0_amd64.deb
 ```
 
-بسته شامل `/usr/bin/slm`، `/usr/bin/slm-gradcheck`، کانفیگ‌ها، کورپوس نمونه و مستندات است.
-`scripts/make_deb.sh` اگر `dpkg-deb` نبود بسته را دستی (با `ar`+`tar`) می‌سازد، پس روی
-توزیع‌های غیر دبیانی هم می‌توان بسته ساخت؛ خط `Depends` هم از خروجی `ldd` خود باینری ساخته می‌شود.
+بسته‌ی از پیش ساخته‌شده در `dist/` هست (نیاز به glibc ≥ ۲.۳۴ یعنی Ubuntu 22.04+).
+`Depends` از خروجی `ldd` خود باینری ساخته می‌شود و اگر `dpkg-deb` نبود، بسته دستی
+با `ar`+`tar` ساخته می‌شود.
 
-یک بسته‌ی از پیش ساخته‌شده در [`dist/slm_0.1.0_amd64.deb`](dist/) هست:
-
-```
-Depends: libc6 (>= 2.34), libstdc++6 (>= 11), libgomp1, libglx0, libopengl0, libx11-6, libxext6
-```
-
-یعنی روی Ubuntu 22.04+ / Debian 12+ نصب می‌شود. روی توزیع قدیمی‌تر (glibc < 2.34) خودت
-با `./build.sh --deb` بساز — همان یک دستور کافی است.
-
-### بکند libtorch (اختیاری، ~۴ برابر سریع‌تر روی CPU + پشتیبانی CUDA)
+### بکند libtorch (اختیاری، ~۴ برابر سریع‌تر روی CPU + CUDA)
 
 ```bash
 wget https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-2.5.1%2Bcpu.zip
-unzip libtorch-*.zip -d /opt
-./build.sh --libtorch /opt/libtorch --no-gui
-LD_LIBRARY_PATH=/opt/libtorch/lib build/slm info
+unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 ```
 
-هر دو بکند دقیقاً یک مدل و یک `.slm` را می‌فهمند: می‌توانی با libtorch آموزش بدهی و با
-باینری بدون وابستگی اجرا کنی (تست شده: هر دو روی همان چک‌پوینت `loss 0.3524` می‌دهند).
+هر دو بکند یک مدل و یک فایل `.slm` را می‌فهمند (تست‌شده: خروجی eval یکسان).
 
 ---
 
@@ -93,123 +102,142 @@ LD_LIBRARY_PATH=/opt/libtorch/lib build/slm info
 
 | سند | محتوا |
 |---|---|
-| [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | ۱) نمای کلی معماری، نمودار، لایه‌های کد، همزمانی، بودجه‌ی حافظه |
-| [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | ۲) **توضیح فنی دقیق coordinator** و روش ترکیب سه منبع آپدیت |
-| [`docs/STEP_BY_STEP.fa.md`](docs/STEP_BY_STEP.fa.md) | ۳) پیاده‌سازی گام‌به‌گام از مدل پایه تا هر سه ترد |
+| [`docs/MULTILINGUAL.fa.md`](docs/MULTILINGUAL.fa.md) | **استراتژی توکنایزر، ترکیب دیتاست با درصد، پلن آموزش مرحله‌ای، ارزیابی** + منابع فارسی/کد |
+| [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | توضیح فنی دقیق coordinator و ترکیب سه منبع آپدیت |
+| [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | نمای کلی معماری، نمودار، همزمانی، بودجه‌ی حافظه |
+| [`docs/SCALING.fa.md`](docs/SCALING.fa.md) | **۷ تریلیون پارامتر: اعداد واقعی** و نردبان اندازه‌های عملی |
+| [`docs/STEP_BY_STEP.fa.md`](docs/STEP_BY_STEP.fa.md) | پیاده‌سازی گام‌به‌گام |
 
 ---
 
-## نتایج اندازه‌گیری‌شده (روی همین مخزن)
+## نتایج اندازه‌گیری‌شده
+
+مدل دمو: **۷.۳۵M پارامتر**، ۶ لایه، ۸ هد پرسش / ۲ هد KV، dim 320، ctx 256،
+`rmsnorm+rope+swiglu+gqa8:2`، ۱۸۰۰ گام در ۱۴ دقیقه (libtorch CPU، ۸ هسته).
+
+```
+  source   lang        loss   perplexity  bits/char  chars/tok
+  fa       fa        0.3275         1.39     0.0956       4.94
+  en       en        0.3118         1.37     0.0903       4.98
+  py       py        0.0713         1.07     0.0294       3.50
+  ALL      -         0.2369         1.27          -          -
+
+  lang    holdout      ppl  interfere   py-valid
+  fa       0.3357     1.40       0.4%          -
+  en       0.3151     1.37       0.0%          -
+  py       0.0710     1.07       0.0%       100%
+```
 
 | مورد | نتیجه |
 |---|---|
-| تست صحت گرادیان | **۲۶/۲۶ پاس** (بکند بومی)، **۲۵/۲۵ پاس** (libtorch) — شامل تطابق دقیق checkpointing |
-| GEMM بومی | ۶۱ GFLOP/s تک‌هسته، ۱۸۰ GFLOP/s روی ۸ هسته (AVX2+FMA) |
-| آموزش (بومی) | ۴۵۱۸ tok/s برای ۱M پارامتر، ۸۳۸ tok/s برای ۱۱.۵M (batch 8، ctx 256) |
-| آموزش (libtorch CPU) | ۳۴۸۱ tok/s برای ۱۱.۵M — همان کانفیگ، ۴.۲ برابر سریع‌تر |
-| مدل دمو (`models/demo-6m.slm`) | ۶.۳۸M پارامتر، ۱۴۰۰ گام در ۱۶ دقیقه، holdout loss **۷.۱۰ → ۰.۳۳** (ppl 1.39) |
-| تولید با KV-cache | ۵۶–۷۵ tok/s روی CPU برای همین مدل |
-| کوانتیزاسیون | fp16 نصف، int8 گروهی ~۳.۹ برابر کوچک‌تر (با گزارش خطای RMS) |
-| checkpointing | حافظه‌ی فعال‌سازی از ۴۳۲MiB به ۹۰MiB (batch 8، ctx 256، dim 384) |
-
-نمونه‌ی خروجی مدل دمو (بکند بومی، دمای ۰.۷):
-
-```
-what is the capital of Japan?      -> The capital of Japan is Tokyo.
-how many legs does a spider have?  -> A spider has eight legs.
-what is attention?                 -> Attention is a weighted average over tokens
-                                      where the weights come from query and key similarity.
-hello                              -> Hello! How can I help you today?
-compute 12 + 30                    -> 12 + 30 = 32.        ← حساب برای مدل ۶M هنوز غلط است
-```
+| تست گرادیان | **۳۱/۳۱** بومی، **۳۰/۳۰** libtorch (شامل RoPE/RMSNorm/SwiGLU/GQA و checkpointing) |
+| تست متن/توکنایزر | **۴۲/۴۲** (UTF-8، نرمال‌سازی فارسی، pretokenize، تشخیص زبان، بررسی پایتون) |
+| fertility فارسی | ۴.۹۵ کاراکتر بر توکن، سهم توکن تک‌بایتی ۱۴.۹٪ |
+| GEMM بومی | ۶۱ GFLOP/s تک‌هسته، ۱۸۰ GFLOP/s روی ۸ هسته |
+| آموزش | ۴۲۷۰ tok/s (libtorch CPU) / ~۱۸۰۰ tok/s (بومی) برای همین مدل |
+| تولید با KV-cache | ۳۰–۸۵ tok/s روی CPU |
+| checkpointing | فعال‌سازی ۴۳۲MiB → ۹۰MiB |
+| کوانتیزاسیون | fp16 نصف (خطای RMS ۰.۰۱۸٪)، int8 گروهی ~۳.۹ برابر کوچک‌تر |
+| کد از دستور فارسی | ۱۰۰٪ خروجی‌های پایتون از فیلتر ساختاری رد می‌شوند |
 
 ---
 
-## سیستم خودآموزی
+## فارسی: چه چیزی واقعاً حل شده
 
-سه ترد مستقل، هر کدام با replica خودش از مدل، هرگز روی وزن زنده نمی‌نویسند:
+| لایه | کار انجام‌شده |
+|---|---|
+| نرمال‌سازی | ي→ی، ك→ک، ة→ه، أ/إ→ا، حذف اعراب و کشیده، ارقام فارسی/عربی→ASCII، تجزیه‌ی شکل‌های نمایشی (U+FE70..FEFF)، حذف نویسه‌های bidi، اصلاح فاصله‌های اطراف نیم‌فاصله |
+| pretokenize | نیم‌فاصله **داخل** کلمه می‌ماند؛ «، ؛ ؟ « »» قطعه‌ی مستقل؛ دندانه‌گذاری پایتون یک قطعه؛ هر رقم یک توکن |
+| سازگاری | پرچم نرمال‌سازی داخل فایل توکنایزر ذخیره می‌شود تا آموزش و inference هرگز ناهم‌خوان نشوند |
+| ارزیابی | holdout و BPC جدا برای فارسی + سنجش نشت لاتین به فارسی |
+| خودآموزی | فیلتر تداخل زبانی روی نمونه‌های خودتولید فارسی + گیت per-language در coordinator |
+| GUI | shaping واقعی با HarfBuzz (حروف چسبان، لیگاتور لام‌الف، mark positioning) + bidi ساده + fallback فونت لاتین برای خطوط ترکیبی |
+| ترمینال | داشبورد ANSI برای محیط‌هایی که فونت/نمایشگر ندارند |
 
-| ترد | داده | الگوریتم | محافظ |
+اگر HarfBuzz/FreeType نصب نباشد، GUI بیلد و اجرا می‌شود اما فارسی را شکل نمی‌دهد
+و پیام می‌دهد؛ داشبورد ترمینالی جایگزین کامل است.
+
+---
+
+## سیستم خودآموزی (خلاصه)
+
+| ترد | داده | الگوریتم | محافظ چندزبانه |
 |---|---|---|---|
-| **الف) continual** | ورودی‌های کاربر (بافر شده) | fine-tune سبک، `lr` ۶۰ برابر کمتر | ۵۰٪ replay از کورپوس اصلی + freeze دو بلوک آخر |
-| **ب) self-gen** | تولید خود مدل | فیلتر کیفیت چهارگانه، سپس آموزش روی بازمانده‌ها | باند perplexity **نسبی**، نسبت تکرار ۴-گرام، طول، تازگی |
-| **ج) feedback** | امتیاز ۱..۵ کاربر | **DPO** (+ جمله‌ی SFT کوچک)، در نبود جفت: reward-weighted | مرجع = snapshot ابتدای دور (بدون مدل دوم در حافظه) |
+| **الف) continual** | ورودی کاربر | fine-tune سبک، `lr` ۶۰× کمتر | replay **round-robin روی همه‌ی زبان‌ها** |
+| **ب) self-gen** | تولید خود مدل | فیلتر کیفیت + آموزش | باند perplexity نسبی هر زبان، تداخل زبانی برای fa/en، بررسی ساختاری پایتون برای py، تازگی |
+| **ج) feedback** | امتیاز ۱..۵ | **DPO** + جمله‌ی SFT | انتخاب جفت round-robin بین زبان‌ها + replay همه‌ی زبان‌ها با وزن ۰.۵ |
 
 و coordinator که تنها نویسنده است:
 
 ```
 Fisher damping (EWC) → trust-region هر منبع → تراش TIES → تصویرسازی PCGrad
-→ انتخاب علامت + میانگین وزنی (اولویت × credit یادگیرنده) → محدودکننده‌ی نرخ
-→ line-search روی α∈{1,½,¼} با گیت دوگانه‌ی holdout (loss + آنتروپی) و سقف رانش از anchor
-→ پذیرش = swap اتمیک اشاره‌گر  |  رد = rollback خودکار (هیچ چیز اعمال نمی‌شود)
+→ انتخاب علامت + میانگین وزنی (اولویت × credit) → محدودکننده‌ی نرخ
+→ line-search روی α∈{1,½,¼} با گیت holdout **برای هر زبان جدا** + سقف آنتروپی
+→ پذیرش = swap اتمیک اشاره‌گر  |  رد = rollback خودکار
 ```
 
-جزئیات کامل و ریاضیات هر مرحله: [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md).
-
-نمونه‌ی واقعی از `audit.jsonl` (لاگ کامل و قابل بازبینی هر تصمیم):
+نمونه‌ی واقعی از `audit.jsonl`:
 
 ```json
-{"level":"propose","source":"self-generated","message":"3/6 synthetic samples kept ...","delta_norm":"0.013"}
-{"level":"filtered","source":"self-generated","message":"dropped: degenerate (ppl 1.0001 < 1.0005)"}
-{"level":"accept","source":"coordinator","message":"accepted (alpha=1.00) holdout 0.3695 -> 0.3694 (gate 0.3725)",
- "projections":"2","merged_norm":"0.036857","rate_left":"0.1200"}
-{"level":"reject","source":"coordinator","message":"auto-rollback, rejected: holdout regression 1.1864 -> 1.1869 > gate 1.1866"}
+{"level":"accept","source":"coordinator","message":"accepted (alpha=1.00) holdout 0.2489 -> 0.2489",
+ "holdout_fa":"0.3357->0.3352","holdout_en":"0.3151->0.3149","holdout_py":"0.0710->0.0711"}
+{"level":"filtered","source":"self-generated","message":"dropped: language interference (foreign letters 0.31)","lang":"fa"}
+{"level":"filtered","source":"self-generated","message":"dropped: invalid python: unbalanced brackets","lang":"py"}
+{"level":"propose","source":"feedback","message":"DPO: 3 preference pairs + 3 replay batches (w=0.50) [fa 2p/7r  en 1p/4r  py 0p/3r]"}
 ```
-
----
-
-## ImGui یا Qt؟
-
-برای این پروژه **Dear ImGui** انتخاب شد:
-
-* پنل‌ها تابع محض حالت عددی زنده‌اند و هر فریم عوض می‌شوند (loss، ماتریس توجه، توزیع توکن).
-  در UI به‌سبک immediate-mode همین یعنی «هر فریم از حالت فعلی بکش»؛ در Qt نیاز به model،
-  signal/slot و invalidate دستی داری.
-* نقشه‌ی حرارتی ۲۵۶×۲۵۶ در ImGui چند فراخوان `AddRectFilled` است؛ در Qt یک `QWidget`
-  سفارشی با `paintEvent` و کش pixmap.
-* وابستگی: چند فایل سورس که داخل باینری کامپایل می‌شوند — بدون moc/uic، بدون runtime جدا،
-  لینک استاتیک بی‌دردسر، بدون ملاحظات LGPL.
-* **Qt کجا بهتر است؟** اپلیکیشن دسکتاپ سند-محور با ویجت‌های نیتیو، منو، i18n و
-  دسترس‌پذیری (accessibility). این پروژه یک «کابین رصد» است، پس ImGui از هر دو جهت
-  تأخیر و هزینه‌ی نگه‌داری برنده است.
-
-نکته: ImGui شکل‌دهی RTL/عربی ندارد؛ برای متن فارسی داشبورد ترمینالی (`slm live`) بهتر است.
 
 ---
 
 ## دستورات CLI
 
 ```
-slm info        [--config F]                            بودجه‌ی حافظه و اطلاعات بکند
-slm tokenizer   --input F --out F [--vocab N]           آموزش BPE بایت‌محور
-slm pretrain    --data F --tokenizer F --out F [...]    آموزش مدل پایه
-slm chat        --ckpt F --tokenizer F [--prompt S]     تولید تعاملی (KV-cache)
-slm eval        --ckpt F --tokenizer F --data F         loss/perplexity روی holdout
-slm quantize    --in F --out F [--dtype q8|f16|f32]     تبدیل چک‌پوینت + گزارش خطا
-slm bench       [--config F] [--batch N]                توان عبوری forward/backward
-slm live        --ckpt F --tokenizer F --data F         سیستم کامل + داشبورد ترمینالی
-slm dashboard   --ckpt F --tokenizer F --data F         سیستم کامل + داشبورد ImGui
-slm_gradcheck                                           تست عددی گرادیان‌ها
+slm info        [--config F]                            بودجه‌ی حافظه و بکند
+slm plan        --params 7e12 [--experts N --topk N]     برنامه‌ریز حافظه/محاسبه
+slm tokenizer   --out F [--vocab N] (--input F | --mix ...)   BPE + گزارش fertility
+slm pretrain    --tokenizer F --out F (--data F | --mix ...)  آموزش با ترکیب وزن‌دار
+slm chat        --ckpt F --tokenizer F [--prompt S]      تولید تعاملی (KV-cache)
+slm eval        --ckpt F --tokenizer F --mix ...         loss/ppl/BPC هر زبان
+slm langcheck   --ckpt F --tokenizer F --mix ...         تداخل زبانی + اعتبار کد
+slm quantize    --in F --out F [--dtype q8|f16|f32]      تبدیل چک‌پوینت
+slm bench       [--config F] [--batch N]                 توان عبوری
+slm live        / slm dashboard                          سیستم کامل + داشبورد
+slm_gradcheck   / slm_texttest                           تست‌ها
 ```
 
-کلیدهای داشبورد ترمینالی: `1|2|3` روشن/خاموش کردن هر ترد، `x` Emergency Stop،
-`b` بازگشت به بهترین snapshot، `a <متن>` پرسیدن، `r <امتیاز>` امتیاز به آخرین پاسخ، `q` خروج.
-
-هر کلید کانفیگ را می‌توان از خط فرمان هم داد: `--set coord.ties_keep=0.2 --set selfgen.lr=5e-6`.
+هر کلید کانفیگ از خط فرمان هم قابل تنظیم است: `--set coord.ties_keep=0.2`.
 
 ---
 
-## سخت‌افزار هدف: ۱۶GB RAM / ۲GB VRAM
+## معماری مدل
 
-`slm info --config configs/slm-124m.conf` بودجه را چاپ می‌کند. خلاصه‌ی صادقانه:
+دو خانواده، با یک کد و انتخاب از طریق کانفیگ:
 
-* **۱۶GB RAM**: آموزش کامل تا ~۱۲۴M پارامتر جا می‌شود (۲GB وزن+گرادیان+AdamW).
-  محدودیت واقعی سرعت CPU است، نه حافظه.
-* **۲GB VRAM**: آموزش کامل ۱۲۴M جا نمی‌شود. آموزش *جزئی* (دو بلوک آخر + head، همان حالتی
-  که سه ترد خودآموزی در آن کار می‌کنند) با gradient checkpointing حدود ۰.۷GB است و جا می‌شود.
-* ۵۰۰M پارامتر روی ۲GB VRAM برای *آموزش* واقع‌بینانه نیست؛ برای *inference* با وزن int8 بله.
-* fp16/int8 در این نسخه در لایه‌ی **ذخیره‌سازی** پیاده شده (چک‌پوینت ۲ و ۳.۹ برابر کوچک‌تر)
-  و مسیر محاسبه fp32 (بومی) یا fp16/CUDA (libtorch) است.
+| legacy (GPT-2/nanoGPT) | modern (پیش‌فرض) |
+|---|---|
+| موقعیت یادگیرنده (جدول) | **RoPE** — سقف طول در وزن‌ها حک نمی‌شود |
+| LayerNorm (gain+bias) | **RMSNorm** — ارزان‌تر و پایدارتر |
+| MLP 4× با GELU | **SwiGLU** (gate × up، ~۸/۳ برابر) |
+| multi-head attention | **GQA** (`n_kv_head`) — KV cache ۴ برابر کوچک‌تر |
+| bias روی همه‌ی linear‌ها | بدون bias |
+
+```
+model.norm = rms|layer    model.pos = rope|learned    model.ffn = swiglu|gelu
+model.n_kv_head = 2       model.rope_theta = 10000    model.linear_bias = false
+```
+
+---
+
+## سخت‌افزار: ۱۶GB RAM / ۲GB VRAM
+
+`slm plan --ram 16 --vram 2 --params <N>` برای هر اندازه‌ای عدد می‌دهد. خلاصه:
+
+* **آموزش کامل** تا ~۱۵۰M پارامتر عملی است (روی ۲GB VRAM با bf16 + 8-bit optimiser
+  + checkpointing؛ روی CPU محدودیت زمان است نه حافظه).
+* **fine-tune جزئی** (دو بلوک آخر + head) یک مدل ~۱–۳B را روی ۲GB VRAM ممکن می‌کند —
+  همان حالتی که سه ترد خودآموزی در آن کار می‌کنند.
+* **inference int8** تا ~۱.۸B روی ۲GB VRAM و تا ~۱۶B روی ۱۶GB RAM.
+* **۷ تریلیون پارامتر**: ~۳۸TB حالت آموزش و ~۴۹۰ کارت ۸۰گیگی — روی این سخت‌افزار
+  ممکن نیست. جزئیات و نردبان کامل: [`docs/SCALING.fa.md`](docs/SCALING.fa.md).
 
 ---
 
@@ -218,36 +246,34 @@ slm_gradcheck                                           تست عددی گراد
 ```
 src/
   core/tensor.h            façade مشترک هر دو بکند
-  core/tensor_native.cpp   autograd بومی + checkpointing
+  core/tensor_native.cpp   autograd بومی + RoPE/RMSNorm/SwiGLU/GQA + checkpointing
   core/tensor_torch.cpp    بکند libtorch (همان façade)
-  core/gemm.{h,cpp}        کرنل SGEMM با AVX2/FMA + OpenMP و انتخاب در زمان اجرا
-  core/{optim,serialize,params,dataset,config,rng}.*
-  model.{h,cpp}            GPT decoder-only، freeze، KV-cache، capture توجه
-  tokenizer.{h,cpp}        BPE بایت‌محور
-  coordinator.{h,cpp}      ادغام و گیت‌کردن آپدیت‌ها  ← هسته‌ی پروژه
-  trainer.{h,cpp}          زیرساخت مشترک تردها
-  train_continual.{h,cpp}  (الف)
-  train_selfgen.{h,cpp}    (ب)
-  train_feedback.{h,cpp}   (ج) DPO
-  telemetry.{h,cpp}        سری‌های زمانی + audit JSONL
-  chat.{h,cpp}             ترد inference
-  gui.{h,cpp}              داشبورد ImGui
-  gui_terminal.cpp         داشبورد ANSI
-  app.cpp                  سیم‌کشی کل سیستم + autopilot
-  main.cpp                 CLI
-  tests/gradcheck.cpp      تست عددی گرادیان
-configs/  slm-tiny.conf | slm-demo.conf | slm-124m.conf
-scripts/  install_deps.sh | make_sample_data.py | fetch_data.sh | quickstart.sh | make_deb.sh
-build.sh
+  core/gemm.{h,cpp}        SGEMM با AVX2/FMA + OpenMP و انتخاب در زمان اجرا
+  core/text.{h,cpp}        UTF-8، نرمال‌سازی فارسی، تشخیص زبان، بررسی پایتون
+  core/dataset.{h,cpp}     TokenDataset + MixtureDataset (وزن‌دار، holdout هر زبان)
+  core/{optim,serialize,params,config,rng}.*
+  model.{h,cpp}            ترنسفورمر (دو خانواده‌ی معماری)، freeze، KV-cache
+  tokenizer.{h,cpp}        BPE بایت‌محور + نرمال‌سازی + fertility
+  coordinator.{h,cpp}      ادغام و گیت per-language  ← هسته‌ی پروژه
+  trainer.{h,cpp} train_continual.* train_selfgen.* train_feedback.*
+  telemetry.* chat.* app.* main.cpp
+  gui.cpp gui_text.{h,cpp} gui_terminal.cpp    داشبورد + shaping فارسی
+  tests/gradcheck.cpp tests/text_test.cpp
+configs/  slm-tiny | slm-demo | slm-124m
+scripts/  install_deps | make_trilingual_data | make_sample_data | fetch_data | quickstart | make_deb
+models/   demo-tri.slm (fp16، آموزش‌دیده) + demo-tri.slmtok
 ```
 
 ## محدودیت‌های شناخته‌شده
 
-* کورپوس نمونه مصنوعی و قالبی است؛ برای متن واقعی `scripts/fetch_data.sh` (tiny-shakespeare) یا
-  دیتای خودت را بده. مدل ۶M روی کورپوس قالبی سریع overfit می‌شود.
-* آموزش روی GPU فقط با بکند libtorch (`--libtorch` + CUDA build) در دسترس است؛ موتور بومی CPU-only است.
-* int8 فعلاً فقط ذخیره‌سازی است، ضرب ماتریسی int8 پیاده نشده.
-* ImGui متن RTL را شکل‌دهی نمی‌کند.
+* کورپوس نمونه **مصنوعی و قالبی** است (برای اینکه مخزن بدون متن ثالث بماند و
+  ارزیابی خودکار ممکن باشد). برای مدل واقعی منابع بخش ۲ سند MULTILINGUAL را بگیر.
+  به همین دلیل vocab روی ~۲k اشباع می‌شود و مدل ۷M در حساب ضعیف است.
+* **MoE و شاردینگ چند-دستگاهی پیاده نشده‌اند** (در `slm plan` مدل‌سازی شده‌اند).
+* int8 فعلاً فقط در لایه‌ی ذخیره‌سازی است، ضرب ماتریسی int8 نه.
+* GPU فقط با بکند libtorch.
+* ImGui خودش RTL نمی‌فهمد؛ متن فارسی از مسیر HarfBuzz رندر می‌شود، اما
+  ویجت ورودی متن هنوز فارسی را شکل نمی‌دهد (پیش‌نمایش شکل‌دهی‌شده زیر آن نشان داده می‌شود).
 
 ## مجوز
 

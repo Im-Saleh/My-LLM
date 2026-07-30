@@ -236,6 +236,12 @@ Tensor Tensor::add_bias(const Tensor& b) const {
   return Tensor(wrap(raw(*this) + raw(b)));  // broadcasting over the leading dims
 }
 Tensor Tensor::gelu() const { return Tensor(wrap(torch::gelu(raw(*this), "tanh"))); }
+Tensor Tensor::silu() const { return Tensor(wrap(torch::silu(raw(*this)))); }
+Tensor Tensor::rmsnorm(const Tensor& gain, float eps) const {
+  const torch::Tensor& x = raw(*this);
+  torch::Tensor ms = x.pow(2).mean(-1, /*keepdim=*/true);
+  return Tensor(wrap(x * torch::rsqrt(ms + eps) * raw(gain)));
+}
 Tensor Tensor::softmax_last() const {
   return Tensor(wrap(torch::softmax(raw(*this), -1)));
 }
@@ -321,6 +327,31 @@ Tensor seq_logprob(const Tensor& logits, const std::vector<int32_t>& targets,
 
 Tensor logsigmoid(const Tensor& x) {
   return Tensor(wrap(torch::log_sigmoid(raw(x))));
+}
+
+Tensor rope(const Tensor& x, int64_t pos_offset, float theta) {
+  const torch::Tensor& t = raw(x);
+  SLM_CHECK(t.dim() == 4, "rope: expected [B,H,T,D]");
+  const int64_t T = t.size(2), D = t.size(3);
+  SLM_CHECK(D % 2 == 0, "rope: head dim must be even");
+  const auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(t.device());
+  torch::Tensor idx = torch::arange(D / 2, fopt);
+  torch::Tensor inv = torch::pow(theta, -(idx * 2.0f) / static_cast<double>(D));
+  torch::Tensor pos = torch::arange(pos_offset, pos_offset + T, fopt);
+  torch::Tensor ang = pos.unsqueeze(1) * inv.unsqueeze(0);          // [T, D/2]
+  torch::Tensor cos = ang.cos().unsqueeze(0).unsqueeze(0);          // [1,1,T,D/2]
+  torch::Tensor sin = ang.sin().unsqueeze(0).unsqueeze(0);
+  torch::Tensor pairs = t.reshape({t.size(0), t.size(1), T, D / 2, 2});
+  torch::Tensor a = pairs.select(-1, 0);
+  torch::Tensor b = pairs.select(-1, 1);
+  torch::Tensor ra = a * cos - b * sin;
+  torch::Tensor rb = a * sin + b * cos;
+  return Tensor(wrap(torch::stack({ra, rb}, -1).reshape(t.sizes())));
+}
+
+Tensor repeat_kv(const Tensor& x, int64_t repeat) {
+  if (repeat == 1) return x;
+  return Tensor(wrap(raw(x).repeat_interleave(repeat, /*dim=*/1)));
 }
 
 Tensor checkpoint(const std::function<Tensor(const Tensor&)>& fn, const Tensor& x) {

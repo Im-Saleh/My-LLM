@@ -13,6 +13,8 @@
 //                             |
 //                          Dashboard (ImGui or terminal)
 #include <algorithm>
+
+#include "core/text.h"
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -64,25 +66,35 @@ TrainerConfig trainer_defaults(const Config& c, const char* prefix, float lr,
 // soak tests and for the --autopilot demo, never required by the system.
 class Autopilot {
  public:
-  Autopilot(const Tokenizer* tok, const TokenDataset* ds, ChatEngine* chat,
+  Autopilot(const Tokenizer* tok, const MixtureDataset* ds, ChatEngine* chat,
             InteractionHub* hub, Telemetry* tel, uint64_t seed, double period)
       : tok_(tok), chat_(chat), hub_(hub), tel_(tel), rng_(seed), period_(period) {
     if (!ds) return;
-    const std::vector<int32_t>& t = ds->tokens();
-    const int64_t limit = ds->train_tokens();
-    for (int64_t i = 0; i < limit && qa_.size() < 512; ++i) {
-      if (t[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
-      int64_t a = i + 1;
-      while (a < limit && t[static_cast<size_t>(a)] != Tokenizer::kAssistant && a - i < 48) ++a;
-      if (a >= limit || t[static_cast<size_t>(a)] != Tokenizer::kAssistant) continue;
-      int64_t e = a + 1;
-      while (e < limit && t[static_cast<size_t>(e)] != Tokenizer::kEot && e - a < 64) ++e;
-      if (e >= limit) break;
-      QA qa;
-      qa.question = tok_->decode(std::vector<int32_t>(t.begin() + i + 1, t.begin() + a));
-      qa.answer = tok_->decode(std::vector<int32_t>(t.begin() + a + 1, t.begin() + e));
-      if (!qa.question.empty() && !qa.answer.empty()) qa_.push_back(std::move(qa));
-      i = e;
+    // Mine question/answer pairs from *every* source, so the synthetic user
+    // rates Persian, English and Python in turn instead of biasing one language.
+    for (int si = 0; si < ds->num_sources(); ++si) {
+      const std::vector<int32_t>& t = ds->data(si).tokens();
+      const int64_t limit = ds->data(si).train_tokens();
+      size_t added = 0;
+      for (int64_t i = 0; i < limit && added < 256; ++i) {
+        if (t[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
+        int64_t a = i + 1;
+        while (a < limit && t[static_cast<size_t>(a)] != Tokenizer::kAssistant && a - i < 48) ++a;
+        if (a >= limit || t[static_cast<size_t>(a)] != Tokenizer::kAssistant) continue;
+        int64_t e = a + 1;
+        while (e < limit && t[static_cast<size_t>(e)] != Tokenizer::kEot && e - a < 96) ++e;
+        if (e >= limit) break;
+        QA qa;
+        qa.lang = ds->info(si).lang;
+        qa.question = tok_->decode(std::vector<int32_t>(t.begin() + i + 1, t.begin() + a));
+        qa.answer = tok_->decode(std::vector<int32_t>(t.begin() + a + 1, t.begin() + e));
+        if (!qa.question.empty() && !qa.answer.empty()) {
+          qa_.push_back(std::move(qa));
+          ++added;
+        }
+        i = e;
+      }
+      lang_offsets_.push_back(qa_.size());
     }
   }
 
@@ -101,6 +113,7 @@ class Autopilot {
  private:
   struct QA {
     std::string question, answer;
+    Lang lang = Lang::kUnknown;
   };
 
   static float overlap_score(const std::string& want, const std::string& got) {
@@ -138,7 +151,18 @@ class Autopilot {
       // Ask a fresh question most of the time, but deliberately repeat an
       // earlier one now and then: two different answers to the *same* prompt
       // with different ratings is what turns the feedback thread into DPO.
-      size_t pick = static_cast<size_t>(rng_.below(qa_.size()));
+      // Walk the languages in turn (so the feedback stream stays balanced),
+      // and now and then repeat an earlier question to create a DPO pair.
+      size_t pick = 0;
+      if (lang_offsets_.empty()) {
+        pick = static_cast<size_t>(rng_.below(qa_.size()));
+      } else {
+        const size_t g = lang_cursor_++ % lang_offsets_.size();
+        const size_t begin = g ? lang_offsets_[g - 1] : 0;
+        const size_t end = lang_offsets_[g];
+        pick = (end > begin) ? begin + static_cast<size_t>(rng_.below(end - begin))
+                             : static_cast<size_t>(rng_.below(qa_.size()));
+      }
       if (!recent_.empty() && rng_.uniform() < 0.45f)
         pick = recent_[static_cast<size_t>(rng_.below(recent_.size()))];
       recent_.push_back(pick);
@@ -157,9 +181,10 @@ class Autopilot {
         chat_->rate(h.size() - 1, score);
         if (tel_)
           tel_->log("info", "autopilot", "asked and rated",
-                    {{"q", qa.question.substr(0, 60)},
-                     {"expected", qa.answer.substr(0, 60)},
-                     {"got", h.back().response.substr(0, 60)},
+                    {{"lang", lang_code(qa.lang)},
+                     {"q", utf8_truncate(qa.question, 60)},
+                     {"expected", utf8_truncate(qa.answer, 60)},
+                     {"got", utf8_truncate(h.back().response, 60)},
                      {"score", std::to_string(score)}});
       }
       ++asked;
@@ -176,7 +201,9 @@ class Autopilot {
   Rng rng_;
   double period_;
   std::vector<QA> qa_;
+  std::vector<size_t> lang_offsets_;
   std::vector<size_t> recent_;
+  size_t lang_cursor_ = 0;
   std::thread th_;
   std::atomic<bool> run_{false};
 };
@@ -201,12 +228,20 @@ int run_self_training(const AppOptions& opt) {
   mcfg.vocab_size = tok.vocab_size();
   mcfg.grad_checkpointing = opt.cfg.get_bool("model.grad_checkpointing", true);
 
-  TokenDataset ds;
+  MixtureDataset ds;
+  if (opt.data.empty()) {
+    std::fprintf(stderr,
+                 "warning: no corpus given (--data F or --mix fa=F:0.4,en=F:0.3,py=F:0.3):\n"
+                 "         replay, per-language hold-out gating and the autopilot are disabled\n");
+  }
   if (!opt.data.empty()) {
     std::string err;
-    if (!ds.load_text_file(opt.data, tok, &err))
-      std::fprintf(stderr, "warning: corpus not loaded (%s); replay and hold-out gating are disabled\n",
+    if (!ds.add_spec(opt.data, tok, &err))
+      std::fprintf(stderr,
+                   "warning: corpus not loaded (%s); replay and hold-out gating are disabled\n",
                    err.c_str());
+    else
+      std::printf("corpus mixture:\n%s", ds.describe().c_str());
   }
 
   std::error_code ec;
@@ -218,7 +253,8 @@ int run_self_training(const AppOptions& opt) {
           {{"backend", backend_name()},
            {"model", mcfg.describe()},
            {"checkpoint", opt.ckpt},
-           {"corpus_tokens", std::to_string(ds.num_tokens())}});
+           {"corpus_tokens", std::to_string(ds.total_tokens())},
+           {"sources", std::to_string(ds.num_sources())}});
 
   // ------------------------------------------------- trainer configurations
   const Config& c = opt.cfg;

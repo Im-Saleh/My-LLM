@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "telemetry.h"
 
+#include "core/text.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -46,8 +48,27 @@ const char* stream_name(Stream s) {
       return "feedback";
     case Stream::kHoldout:
       return "holdout";
+    case Stream::kHoldoutFa:
+      return "holdout fa";
+    case Stream::kHoldoutEn:
+      return "holdout en";
+    case Stream::kHoldoutPy:
+      return "holdout py";
     default:
       return "?";
+  }
+}
+
+Stream stream_for_lang(Lang l) {
+  switch (l) {
+    case Lang::kPersian:
+      return Stream::kHoldoutFa;
+    case Lang::kEnglish:
+      return Stream::kHoldoutEn;
+    case Lang::kPython:
+      return Stream::kHoldoutPy;
+    default:
+      return Stream::kHoldout;
   }
 }
 
@@ -156,7 +177,10 @@ void Telemetry::open_audit(const std::string& path) {
 }
 
 namespace {
-std::string json_escape(const std::string& s) {
+std::string json_escape(const std::string& raw) {
+  // Always emit valid UTF-8: a Persian string cut mid-sequence anywhere upstream
+  // would otherwise produce an audit log that no JSON parser can read.
+  const std::string s = utf8_sanitize(raw);
   std::string o;
   o.reserve(s.size() + 8);
   for (char c : s) {

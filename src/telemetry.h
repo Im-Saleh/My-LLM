@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "core/text.h"
 #include "model.h"
 
 namespace slm {
@@ -33,9 +34,14 @@ enum class Stream : int {
   kContinual = 0,
   kSelfGen = 1,
   kFeedback = 2,
-  kHoldout = 3,
-  kCount = 4
+  kHoldout = 3,     // aggregate hold-out loss
+  kHoldoutFa = 4,   // per-language hold-out loss
+  kHoldoutEn = 5,
+  kHoldoutPy = 6,
+  kCount = 7
 };
+// Stream carrying the hold-out loss of one language (kUnknown -> aggregate).
+Stream stream_for_lang(Lang l);
 constexpr int kNumStreams = static_cast<int>(Stream::kCount);
 const char* stream_name(Stream s);
 
@@ -84,6 +90,13 @@ struct CoordinatorStats {
   int64_t fisher_updates = 0;
   float cos[kNumSources][kNumSources] = {};
   bool active[kNumSources] = {};
+  // Per-language hold-out state: this is what makes "did we forget Persian?"
+  // an observable number instead of a guess.
+  bool lang_present[kNumLangs] = {};
+  float lang_val[kNumLangs] = {};
+  float lang_best[kNumLangs] = {};
+  float lang_gate[kNumLangs] = {};
+  float lang_entropy[kNumLangs] = {};
   std::string last_decision = "waiting";
   double last_round_time = 0.0;
   uint64_t weight_version = 0;

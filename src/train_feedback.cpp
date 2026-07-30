@@ -2,6 +2,8 @@
 #include "train_feedback.h"
 
 #include <algorithm>
+
+#include "core/text.h"
 #include <cmath>
 #include <cstdio>
 
@@ -19,13 +21,16 @@ FeedbackConfig FeedbackConfig::from_config(const Config& c) {
       static_cast<int>(c.get_int("feedback.max_rwft_per_round", k.max_rwft_per_round));
   k.bank_cap = c.get_int("feedback.bank_cap", k.bank_cap);
   k.use_dpo = c.get_bool("feedback.use_dpo", k.use_dpo);
+  k.replay_weight = static_cast<float>(c.get_num("feedback.replay_weight", k.replay_weight));
+  k.replay_batches = static_cast<int>(c.get_int("feedback.replay_batches", k.replay_batches));
+  k.balance_languages = c.get_bool("feedback.balance_languages", k.balance_languages);
   return k;
 }
 
 FeedbackTrainer::FeedbackTrainer(Coordinator* coord, Telemetry* tel, InteractionHub* hub,
                                  const GPTConfig& mcfg, const TrainerConfig& tcfg,
                                  const FeedbackConfig& fcfg, const Tokenizer* tok,
-                                 const TokenDataset* corpus, uint64_t seed)
+                                 const MixtureDataset* corpus, uint64_t seed)
     : TrainerBase(Source::kFeedback, coord, tel, mcfg, tcfg, tok, corpus, seed),
       hub_(hub),
       fcfg_(fcfg) {}
@@ -44,6 +49,7 @@ FeedbackTrainer::Item FeedbackTrainer::make_item(const RatedSample& s) const {
   if (static_cast<int64_t>(it.ids.size()) > cap) it.ids.resize(static_cast<size_t>(cap));
   it.score = s.score;
   it.response = s.response;
+  it.lang = detect_language(s.prompt + "\n" + s.response);
   return it;
 }
 
@@ -84,17 +90,20 @@ bool FeedbackTrainer::ready() {
       auto dup = std::find_if(v.begin(), v.end(), [&](const Item& o) {
         return o.response == it.response;
       });
-      if (dup != v.end())
+      const int li = static_cast<int>(it.lang);
+      if (dup != v.end()) {
         *dup = std::move(it);
-      else {
+      } else {
+        ++ratings_lang_[li];
         v.push_back(std::move(it));
         ++bank_items_;
       }
       if (tel_)
         tel_->log("info", source_name(src_), "rating stored",
                   {{"score", std::to_string(s.score)},
-                   {"prompt", s.prompt.substr(0, 80)},
-                   {"response", s.response.substr(0, 80)}});
+                   {"lang", lang_code(detect_language(s.prompt + "\n" + s.response))},
+                   {"prompt", utf8_truncate(s.prompt, 80)},
+                   {"response", utf8_truncate(s.response, 80)}});
     }
     while (bank_items_ > fcfg_.bank_cap && !bank_.empty()) {
       auto it = bank_.begin();
@@ -138,8 +147,27 @@ void FeedbackTrainer::round() {
     for (const Item& i : v)
       if (i.score >= fcfg_.good_score) rwft.push_back(&i);
   }
-  if (static_cast<int>(pairs.size()) > fcfg_.max_pairs_per_round)
+  if (fcfg_.balance_languages && static_cast<int>(pairs.size()) > fcfg_.max_pairs_per_round) {
+    // Round robin over languages so a flood of Persian ratings cannot fill the
+    // whole round.
+    std::vector<std::vector<Pair>> by_lang(kNumLangs);
+    for (const Pair& p : pairs) by_lang[static_cast<int>(p.win->lang)].push_back(p);
+    std::vector<Pair> picked;
+    for (size_t k = 0; picked.size() < static_cast<size_t>(fcfg_.max_pairs_per_round); ++k) {
+      bool any = false;
+      for (int l = 0; l < kNumLangs; ++l) {
+        if (k >= by_lang[l].size()) continue;
+        picked.push_back(by_lang[l][k]);
+        any = true;
+        if (picked.size() >= static_cast<size_t>(fcfg_.max_pairs_per_round)) break;
+      }
+      if (!any) break;
+    }
+    pairs.swap(picked);
+  } else if (static_cast<int>(pairs.size()) > fcfg_.max_pairs_per_round) {
     pairs.resize(static_cast<size_t>(fcfg_.max_pairs_per_round));
+  }
+  for (const Pair& p : pairs) ++pairs_lang_[static_cast<int>(p.win->lang)];
   if (static_cast<int>(rwft.size()) > fcfg_.max_rwft_per_round)
     rwft.resize(static_cast<size_t>(fcfg_.max_rwft_per_round));
   if (pairs.empty() && rwft.empty()) {
@@ -158,6 +186,15 @@ void FeedbackTrainer::round() {
   float first_loss = 0.0f, last_loss = 0.0f;
   int64_t steps = 0;
   const bool use_dpo = fcfg_.use_dpo && !pairs.empty();
+
+  // Language balanced replay batches, drawn once for the whole round.
+  std::vector<Batch> replay;
+  if (fcfg_.replay_weight > 0.0f) {
+    const int64_t want = fcfg_.replay_batches > 0
+                             ? fcfg_.replay_batches
+                             : (corpus_ ? corpus_->num_sources() : 0);
+    add_replay(&replay, want);
+  }
 
   for (int64_t pass = 0; pass < tcfg_.local_steps && !should_stop(); ++pass) {
     model_->zero_grad();
@@ -203,6 +240,16 @@ void FeedbackTrainer::round() {
         total = total.defined() ? total.add(term) : term;
       }
     }
+    // anti-forgetting replay: plain LM loss over every language
+    if (!replay.empty() && fcfg_.replay_weight > 0.0f) {
+      const float w = fcfg_.replay_weight / static_cast<float>(replay.size());
+      for (const Batch& rb : replay) {
+        float lv = 0.0f;
+        Tensor ce = model_->loss(rb.ids, rb.targets, rb.B, rb.T, &lv, nullptr, false);
+        Tensor term = ce.scale(w);
+        total = total.defined() ? total.add(term) : term;
+      }
+    }
     if (!total.defined()) break;
     value = total.host_ptr()[0];
     total.backward();
@@ -220,13 +267,18 @@ void FeedbackTrainer::round() {
   if (use_dpo) pairs_total_ += static_cast<int64_t>(pairs.size());
   else rwft_total_ += static_cast<int64_t>(rwft.size());
 
-  char note[256];
+  std::string langs;
+  for (int l = 0; l < kNumLangs; ++l)
+    if (ratings_lang_[l])
+      langs += std::string(lang_code(static_cast<Lang>(l))) + " " +
+               std::to_string(pairs_lang_[l]) + "p/" + std::to_string(ratings_lang_[l]) + "r  ";
+  char note[384];
   std::snprintf(note, sizeof(note),
-                "%s: %zu %s, beta=%.3f, %lld steps (session pairs=%lld rwft=%lld)",
+                "%s: %zu %s + %zu replay batches (w=%.2f), beta=%.3f, %lld steps [%s]",
                 use_dpo ? "DPO" : "reward-weighted", use_dpo ? pairs.size() : rwft.size(),
-                use_dpo ? "preference pairs" : "rated samples", fcfg_.dpo_beta,
-                static_cast<long long>(steps), static_cast<long long>(pairs_total_),
-                static_cast<long long>(rwft_total_));
+                use_dpo ? "preference pairs" : "rated samples", replay.size(),
+                fcfg_.replay_weight, fcfg_.dpo_beta, static_cast<long long>(steps),
+                langs.c_str());
   submit_delta(first_loss, last_loss,
                static_cast<int64_t>(use_dpo ? pairs.size() : rwft.size()), steps, note);
 }

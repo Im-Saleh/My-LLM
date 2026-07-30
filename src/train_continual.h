@@ -30,7 +30,7 @@ class ContinualTrainer : public TrainerBase {
   ContinualTrainer(Coordinator* coord, Telemetry* tel, InteractionHub* hub,
                    const GPTConfig& mcfg, const TrainerConfig& tcfg,
                    const ContinualConfig& ccfg, const Tokenizer* tok,
-                   const TokenDataset* corpus, uint64_t seed);
+                   const MixtureDataset* corpus, uint64_t seed);
 
  protected:
   bool ready() override;

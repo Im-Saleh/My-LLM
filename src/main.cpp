@@ -29,6 +29,7 @@
 #include "core/optim.h"
 #include "core/serialize.h"
 #include "core/tensor.h"
+#include "core/text.h"
 #include "model.h"
 #include "tokenizer.h"
 
@@ -124,20 +125,43 @@ std::string human_bytes(double b) {
   return buf;
 }
 
+// Builds the corpus mixture from --mix (weighted, multi language) or --data.
+bool build_mixture(const Args& a, const Tokenizer& tok, MixtureDataset* mix,
+                   bool required = true) {
+  const std::string spec = a.has("mix") ? a.str("mix") : a.str("data");
+  if (spec.empty()) {
+    if (required) std::fprintf(stderr, "one of --mix or --data is required\n");
+    return false;
+  }
+  std::string err;
+  if (!mix->add_spec(spec, tok, &err)) {
+    std::fprintf(stderr, "corpus: %s\n", err.c_str());
+    return false;
+  }
+  return true;
+}
+
 void print_usage() {
   std::puts(
       "slm - a small language model with a hybrid self-training pipeline\n"
+      "      (Persian + English + Python)\n"
       "\n"
       "usage: slm <command> [options]\n"
       "\n"
       "  info          [--config F]                       environment + memory budget\n"
-      "  tokenizer     --input F --out F [--vocab 4096]   train a byte level BPE\n"
-      "  pretrain      --data F --tokenizer F --out F     base training\n"
+      "  tokenizer     --out F [--vocab 4096]             train a byte level BPE\n"
+      "                (--input F | --mix fa=F:0.4,en=F:0.3,py=F:0.3) [--no-normalize]\n"
+      "  pretrain      --tokenizer F --out F              base training\n"
+      "                (--data F | --mix fa=F:0.4,en=F:0.3,py=F:0.3)\n"
       "                [--config F] [--steps N] [--batch N] [--ctx N] [--lr X]\n"
       "                [--accum N] [--eval-every N] [--save-every N] [--dtype f16]\n"
       "                [--resume F] [--threads N] [--seed N]\n"
       "  chat          --ckpt F --tokenizer F [--prompt S] [--max-new N] [--temp X]\n"
-      "  eval          --ckpt F --tokenizer F --data F [--batch N] [--ctx N]\n"
+      "  eval          --ckpt F --tokenizer F (--data F | --mix ...) [--batch N]\n"
+      "  langcheck     --ckpt F --tokenizer F --mix ...   per language quality +\n"
+      "                interference (code switching) + python validity\n"
+      "  plan          --params 7e12 [--experts N --topk N --ctx N --ram 16 --vram 2]\n"
+      "                memory / compute planner for very large configurations\n"
       "  quantize      --in F --out F [--dtype q8|f16|f32]\n"
       "  bench         [--config F] [--batch N] [--ctx N] [--iters N]\n"
       "  live          --ckpt F --tokenizer F --data F [--config F] [--seconds N]\n"
@@ -183,41 +207,119 @@ int cmd_info(const Args& a) {
 
 // ---------------------------------------------------------------- tokenizer
 int cmd_tokenizer(const Args& a) {
-  const std::string in = a.str("input");
   const std::string out = a.str("out", "tokenizer.slmtok");
   const int32_t vocab = static_cast<int32_t>(a.integer("vocab", 4096));
-  if (in.empty()) {
-    std::fprintf(stderr, "tokenizer: --input is required\n");
-    return 2;
-  }
-  bool ok = false;
-  const std::string text = read_file(in, &ok);
-  if (!ok || text.empty()) {
-    std::fprintf(stderr, "tokenizer: cannot read %s\n", in.c_str());
-    return 1;
-  }
   Tokenizer tok;
+  tok.set_normalize(!a.flag("no-normalize"));
+
+  // The mixture is sampled *by weight* before the merges are learned: this is
+  // what decides how many Persian merges the vocabulary can afford.
+  struct Part {
+    std::string name, text;
+    double weight = 0.0;
+  };
+  std::vector<Part> parts;
+  if (a.has("mix")) {
+    const std::string spec = a.str("mix");
+    size_t pos = 0;
+    double wsum = 0.0;
+    while (pos <= spec.size()) {
+      const size_t comma = spec.find(',', pos);
+      std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+      if (!item.empty()) {
+        std::string name, path;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) path = item;
+        else {
+          name = item.substr(0, eq);
+          path = item.substr(eq + 1);
+        }
+        double w = 0.0;
+        const size_t colon = path.rfind(':');
+        if (colon != std::string::npos &&
+            path.find_first_not_of("0123456789.eE-+", colon + 1) == std::string::npos) {
+          w = std::stod(path.substr(colon + 1));
+          path = path.substr(0, colon);
+        }
+        bool ok = false;
+        const std::string text = read_file(path, &ok);
+        if (!ok || text.empty()) {
+          std::fprintf(stderr, "tokenizer: cannot read %s\n", path.c_str());
+          return 1;
+        }
+        parts.push_back(Part{name.empty() ? path : name, text, w});
+        wsum += w;
+      }
+      if (comma == std::string::npos) break;
+      pos = comma + 1;
+    }
+    for (Part& p : parts)
+      if (p.weight <= 0.0) p.weight = (1.0 - std::min(1.0, wsum)) / static_cast<double>(parts.size());
+  } else {
+    bool ok = false;
+    const std::string text = read_file(a.str("input"), &ok);
+    if (!ok || text.empty()) {
+      std::fprintf(stderr, "tokenizer: --input or --mix is required\n");
+      return 2;
+    }
+    parts.push_back(Part{"corpus", text, 1.0});
+  }
+
+  // Budget: keep everything if the corpus is small, otherwise cut each source
+  // down to its weighted share of `--budget-mb`.
+  const double budget = a.num("budget-mb", 24.0) * 1024.0 * 1024.0;
+  double wsum = 0.0;
+  for (const Part& p : parts) wsum += p.weight;
+  std::string corpus;
+  std::printf("tokenizer mixture:\n");
+  for (const Part& p : parts) {
+    const double share = wsum > 0 ? p.weight / wsum : 1.0 / parts.size();
+    const size_t want = static_cast<size_t>(std::min<double>(
+        static_cast<double>(p.text.size()), budget * share));
+    // Cut on a UTF-8 boundary and prefer the head of the file.
+    size_t end = std::min(want, p.text.size());
+    while (end > 0 && end < p.text.size() &&
+           (static_cast<unsigned char>(p.text[end]) & 0xC0) == 0x80)
+      --end;
+    corpus.append(p.text, 0, end);
+    corpus.push_back('\n');
+    std::printf("  %-6s share %.2f  using %.2f MB of %.2f MB\n", p.name.c_str(), share,
+                end / 1048576.0, p.text.size() / 1048576.0);
+  }
+
   const double t0 = now_seconds();
-  tok.train(text, vocab, static_cast<int>(a.integer("min-freq", 2)),
+  tok.train(corpus, vocab, static_cast<int>(a.integer("min-freq", 2)),
             [](int32_t done, int32_t total) {
               if (total > 0 && done % 256 == 0)
                 std::printf("\r  merges %d/%d", done, total), std::fflush(stdout);
             });
-  std::printf("\rtrained %zu merges, vocab=%d in %.1fs\n", tok.num_merges(),
-              tok.vocab_size(), now_seconds() - t0);
+  std::printf("\rtrained %zu merges, vocab=%d in %.1fs (normalisation %s)\n",
+              tok.num_merges(), tok.vocab_size(), now_seconds() - t0,
+              tok.normalize() ? "on" : "off");
   if (!tok.save(out)) {
     std::fprintf(stderr, "tokenizer: cannot write %s\n", out.c_str());
     return 1;
   }
-  const std::vector<int32_t> ids = tok.encode(text.substr(0, 4000));
-  std::printf("saved %s   (compression on sample: %.2f bytes/token)\n", out.c_str(),
-              ids.empty() ? 0.0 : 4000.0 / static_cast<double>(ids.size()));
-  const std::string sample = "Hello world! سلام دنیا.";
-  const std::vector<int32_t> rt = tok.encode(sample);
-  std::printf("roundtrip: \"%s\" -> %zu tokens -> \"%s\"  [%s]\n", sample.c_str(),
-              rt.size(), tok.decode(rt).c_str(),
-              tok.decode(rt) == sample ? "exact" : "MISMATCH");
-  return tok.decode(rt) == sample ? 0 : 1;
+
+  // Fertility per source: the number that tells you whether a language is
+  // actually covered by the vocabulary.
+  std::printf("\nfertility (higher chars/token is better, low single-byte share is better)\n");
+  std::printf("  %-8s %-5s %10s %10s %12s\n", "source", "lang", "chars/tok", "bytes/tok", "single-byte");
+  for (const Part& p : parts) {
+    const std::string sample = p.text.substr(0, std::min<size_t>(p.text.size(), 200000));
+    const Tokenizer::FertilityReport f = tok.fertility(sample);
+    std::printf("  %-8s %-5s %10.2f %10.2f %11.1f%%\n", p.name.c_str(),
+                lang_code(detect_language(sample)), f.chars_per_token(), f.bytes_per_token(),
+                100.0 * f.single_byte_share());
+  }
+
+  const std::string probe = "سلام دنیا! می‌روم که ۱۲۳ را یاد بگیرم. def add(a, b): return a + b";
+  const std::vector<int32_t> rt = tok.encode(probe);
+  const std::string back = tok.decode(rt);
+  const std::string norm = tok.preprocess(probe);
+  std::printf("\nround trip: %zu tokens  [%s]\n  in : %s\n  out: %s\n", rt.size(),
+              back == norm ? "exact" : "MISMATCH", probe.c_str(), back.c_str());
+  return back == norm ? 0 : 1;
 }
 
 // ----------------------------------------------------------------- pretrain
@@ -241,12 +343,8 @@ int cmd_pretrain(const Args& a) {
   if (a.has("dim")) g.n_embd = a.integer("dim", g.n_embd);
   if (a.has("checkpointing")) g.grad_checkpointing = a.flag("checkpointing");
 
-  TokenDataset ds;
-  std::string err;
-  if (!ds.load_text_file(a.str("data"), tok, &err)) {
-    std::fprintf(stderr, "pretrain: %s\n", err.c_str());
-    return 1;
-  }
+  MixtureDataset ds;
+  if (!build_mixture(a, tok, &ds)) return 1;
   GPT model(g);
   CheckpointMeta meta;
   if (a.has("resume")) {
@@ -274,15 +372,19 @@ int cmd_pretrain(const Args& a) {
   opt.set_params(model.trainable_params(), model.trainable_names());
 
   std::printf("%s\n", g.describe().c_str());
-  std::printf("corpus: %zu tokens (train %lld / holdout %lld)\n", ds.num_tokens(),
-              static_cast<long long>(ds.train_tokens()),
-              static_cast<long long>(ds.holdout_tokens()));
+  std::printf("corpus mixture (%zu tokens total)\n%s", ds.total_tokens(),
+              ds.describe().c_str());
   std::printf("optimiser state: %s\n", human_bytes(static_cast<double>(opt.state_bytes())).c_str());
   std::printf("training %lld steps, batch %lld x %lld tokens, accum %lld\n\n",
               static_cast<long long>(steps), static_cast<long long>(B),
               static_cast<long long>(T), static_cast<long long>(accum));
 
-  const std::vector<Batch> val = ds.holdout_batches(B, T, 2);
+  // One hold-out slice per source so training prints per-language numbers.
+  std::vector<Batch> val;
+  for (int si = 0; si < ds.num_sources(); ++si) {
+    std::vector<Batch> b = ds.holdout_batches(si, B, T, 2);
+    val.insert(val.end(), b.begin(), b.end());
+  }
   Rng rng(static_cast<uint64_t>(a.integer("seed", 1337)) ^ 0x9e37u);
   const int64_t warmup = a.integer("warmup", std::max<int64_t>(4, steps / 20));
   const int64_t eval_every = a.integer("eval-every", std::max<int64_t>(20, steps / 10));
@@ -319,12 +421,25 @@ int cmd_pretrain(const Args& a) {
       std::fflush(stdout);
     }
     if (!val.empty() && ((step + 1) % eval_every == 0 || step + 1 == steps)) {
-      float vl = 0.0f;
-      for (const Batch& vb : val) vl += model.eval_loss(vb.ids, vb.targets, vb.B, vb.T);
-      vl /= static_cast<float>(val.size());
+      double sum = 0.0;
+      double lang_sum[kNumLangs] = {};
+      int lang_n[kNumLangs] = {};
+      for (const Batch& vb : val) {
+        const float l = model.eval_loss(vb.ids, vb.targets, vb.B, vb.T);
+        sum += l;
+        lang_sum[static_cast<int>(vb.lang)] += l;
+        ++lang_n[static_cast<int>(vb.lang)];
+      }
+      const float vl = static_cast<float>(sum / val.size());
+      const bool best = vl <= best_val;
       best_val = std::min(best_val, vl);
-      std::printf("        >> holdout loss %.4f  (ppl %.2f)%s\n", vl, std::exp(std::min(20.0f, vl)),
-                  vl <= best_val ? "  *best" : "");
+      std::printf("        >> holdout %.4f (ppl %.2f)%s  |", vl, std::exp(std::min(20.0f, vl)),
+                  best ? " *best" : "");
+      for (int l = 0; l < kNumLangs; ++l)
+        if (lang_n[l])
+          std::printf("  %s %.4f", lang_code(static_cast<Lang>(l)),
+                      lang_sum[l] / lang_n[l]);
+      std::printf("\n");
       std::fflush(stdout);
     }
     if (save_every > 0 && (step + 1) % save_every == 0) {
@@ -342,6 +457,7 @@ int cmd_pretrain(const Args& a) {
   g.write_to(m.extra);
   m.extra.set("tokenizer", a.str("tokenizer"));
   m.extra.set("train.holdout_loss", std::to_string(best_val));
+  m.extra.set("train.mixture", a.has("mix") ? a.str("mix") : a.str("data"));
   if (!save_checkpoint(out, *model.snapshot(), m, dt)) {
     std::fprintf(stderr, "pretrain: cannot write %s\n", out.c_str());
     return 1;
@@ -427,25 +543,130 @@ int cmd_eval(const Args& a) {
   std::unique_ptr<GPT> model;
   CheckpointMeta meta;
   if (!load_model(a, &tok, &model, &meta)) return 1;
-  TokenDataset ds;
-  std::string err;
-  if (!ds.load_text_file(a.str("data"), tok, &err)) {
-    std::fprintf(stderr, "eval: %s\n", err.c_str());
-    return 1;
-  }
+  MixtureDataset ds;
+  if (!build_mixture(a, tok, &ds)) return 1;
   const int64_t B = a.integer("batch", 4);
   const int64_t T = std::min<int64_t>(a.integer("ctx", model->config().block_size),
                                       model->config().block_size);
-  const std::vector<Batch> vb = ds.holdout_batches(B, T, static_cast<int>(a.integer("batches", 8)));
-  if (vb.empty()) {
-    std::fprintf(stderr, "eval: hold-out too small\n");
-    return 1;
+  const int nb = static_cast<int>(a.integer("batches", 8));
+  std::printf("%s\n\n", model->config().describe().c_str());
+  // Token perplexity is NOT comparable across languages: a tokenizer that packs
+  // 5 Persian characters into one token and 3 Python characters into one token
+  // produces different numbers for the same modelling quality.  Bits per
+  // character is the tokenizer-independent metric, so both are printed.
+  std::printf("  %-8s %-5s %10s %12s %10s %10s %8s\n", "source", "lang", "loss",
+              "perplexity", "bits/char", "chars/tok", "batches");
+  double total = 0.0;
+  int total_n = 0;
+  for (int si = 0; si < ds.num_sources(); ++si) {
+    const std::vector<Batch> vb = ds.holdout_batches(si, B, T, nb);
+    if (vb.empty()) {
+      std::printf("  %-8s %-5s  (hold-out too small)\n", ds.info(si).name.c_str(),
+                  lang_code(ds.info(si).lang));
+      continue;
+    }
+    double sum = 0.0;
+    for (const Batch& b : vb) sum += model->eval_loss(b.ids, b.targets, b.B, b.T);
+    const double loss = sum / static_cast<double>(vb.size());
+    total += sum;
+    total_n += static_cast<int>(vb.size());
+    const double cpt = std::max(1e-6, ds.info(si).chars_per_token);
+    const double bpc = loss / (cpt * std::log(2.0));
+    std::printf("  %-8s %-5s %10.4f %12.2f %10.4f %10.2f %8zu\n", ds.info(si).name.c_str(),
+                lang_code(ds.info(si).lang), loss, std::exp(loss), bpc, cpt, vb.size());
   }
-  double sum = 0.0;
-  for (const Batch& b : vb) sum += model->eval_loss(b.ids, b.targets, b.B, b.T);
-  const double loss = sum / static_cast<double>(vb.size());
-  std::printf("batches %zu  loss %.4f  perplexity %.2f\n", vb.size(), loss, std::exp(loss));
+  if (total_n) {
+    const double loss = total / total_n;
+    std::printf("  %-8s %-5s %10.4f %12.2f %10s %10s %8d\n", "ALL", "-", loss,
+                std::exp(loss), "-", "-", total_n);
+  }
   return 0;
+}
+
+// ------------------------------------------------------------------ langcheck
+// Generates from each language's own prompts and reports the three things that
+// matter for a multilingual model: quality, interference and code validity.
+int cmd_langcheck(const Args& a) {
+  backend_init(static_cast<int>(a.integer("threads", 0)), a.flag("cuda"));
+  Tokenizer tok;
+  std::unique_ptr<GPT> model;
+  CheckpointMeta meta;
+  if (!load_model(a, &tok, &model, &meta)) return 1;
+  MixtureDataset ds;
+  if (!build_mixture(a, tok, &ds)) return 1;
+
+  const int samples = static_cast<int>(a.integer("samples", 12));
+  GenOptions go;
+  go.max_new_tokens = static_cast<int>(a.integer("max-new", 64));
+  go.temperature = static_cast<float>(a.num("temp", 0.8));
+  go.top_k = static_cast<int>(a.integer("top-k", 40));
+  go.top_p = static_cast<float>(a.num("top-p", 0.95));
+  Rng rng(static_cast<uint64_t>(a.integer("seed", 99)));
+
+  std::printf("%s\n\n", model->config().describe().c_str());
+  std::printf("  %-6s %8s %8s %10s %10s %10s\n", "lang", "holdout", "ppl", "interfere",
+              "py-valid", "samples");
+  int rc = 0;
+  for (int si = 0; si < ds.num_sources(); ++si) {
+    const Lang lang = ds.info(si).lang;
+    // 1) hold-out perplexity for this language
+    const std::vector<Batch> vb =
+        ds.holdout_batches(si, 2, std::min<int64_t>(256, model->config().block_size), 4);
+    double loss = 0.0;
+    for (const Batch& b : vb) loss += model->eval_loss(b.ids, b.targets, b.B, b.T);
+    loss = vb.empty() ? 0.0 : loss / static_cast<double>(vb.size());
+
+    // 2) generate from this language's prompts
+    const std::vector<int32_t>& toks = ds.data(si).tokens();
+    const int64_t limit = ds.data(si).train_tokens();
+    std::vector<std::vector<int32_t>> prompts;
+    for (int64_t i = 0; i < limit && static_cast<int>(prompts.size()) < 256; ++i) {
+      if (toks[static_cast<size_t>(i)] != Tokenizer::kUser) continue;
+      int64_t j = i + 1;
+      while (j < limit && toks[static_cast<size_t>(j)] != Tokenizer::kAssistant && j - i < 64) ++j;
+      if (j >= limit || toks[static_cast<size_t>(j)] != Tokenizer::kAssistant) continue;
+      prompts.emplace_back(toks.begin() + i, toks.begin() + j + 1);
+      i = j;
+    }
+    double switch_sum = 0.0;
+    int py_ok = 0, py_total = 0, n = 0;
+    std::string first_sample;
+    for (int k = 0; k < samples && !prompts.empty(); ++k) {
+      go.seed = rng.next_u64() | 1ull;
+      const std::vector<int32_t>& p = prompts[static_cast<size_t>(rng.below(prompts.size()))];
+      const std::vector<int32_t> out = model->generate(p, go);
+      const std::string text = tok.decode(out);
+      if (first_sample.empty()) first_sample = text;
+      switch_sum += code_switch_ratio(text, lang);
+      if (lang == Lang::kPython) {
+        ++py_total;
+        size_t open = text.find("```");
+        std::string code = text;
+        if (open != std::string::npos) {
+          size_t body = text.find('\n', open);
+          if (body != std::string::npos) {
+            const size_t close = text.find("```", body + 1);
+            code = text.substr(body + 1, close == std::string::npos ? std::string::npos
+                                                                   : close - body - 1);
+          }
+        }
+        if (check_python(code).ok) ++py_ok;
+      }
+      ++n;
+    }
+    const double interfere = n ? switch_sum / n : 0.0;
+    char pybuf[32] = "-";
+    if (py_total) std::snprintf(pybuf, sizeof(pybuf), "%.0f%%", 100.0 * py_ok / py_total);
+    std::printf("  %-6s %8.4f %8.2f %9.1f%% %10s %10d\n", lang_code(lang), loss,
+                std::exp(loss), 100.0 * interfere, pybuf, n);
+    if (a.flag("show") && !first_sample.empty())
+      std::printf("      sample: %s\n", first_sample.substr(0, 200).c_str());
+    // Fail the command when a language is clearly leaking into another.
+    if (interfere > a.num("max-interference", 0.25)) rc = 1;
+  }
+  std::printf("\ninterfere = share of foreign-script letters in this language's output\n");
+  if (rc) std::printf("FAIL: at least one language exceeds the interference threshold\n");
+  return rc;
 }
 
 // ------------------------------------------------------------------ quantize
@@ -489,6 +710,137 @@ int cmd_quantize(const Args& a) {
               human_bytes(static_cast<double>(fb.tellg())).c_str(),
               static_cast<double>(fa.tellg()) / std::max(1.0, static_cast<double>(fb.tellg())),
               100.0 * std::sqrt(num / std::max(1e-12, den)));
+  return 0;
+}
+
+// --------------------------------------------------------------------- plan
+// Memory / compute planner.  The point of this command is to replace wishful
+// thinking with arithmetic before anyone starts a run.
+int cmd_plan(const Args& a) {
+  Config c;
+  if (a.has("config")) c.load(a.str("config"));
+  a.apply_sets(&c);
+  GPTConfig g = GPTConfig::from_config(c);
+
+  double P = a.num("params", 0.0);
+  if (P <= 0.0) P = static_cast<double>(g.param_count());
+  const double experts = std::max(1.0, a.num("experts", 1.0));
+  const double topk = std::min(experts, std::max(1.0, a.num("topk", 1.0)));
+  const double expert_share = a.num("expert-share", 0.67);  // FFN share of params
+  const double active =
+      experts > 1.0 ? P * (1.0 - expert_share) + P * expert_share * topk / experts : P;
+
+  const int64_t ctx = a.integer("ctx", g.block_size);
+  const int64_t batch = a.integer("batch", 1);
+  // When only --params is given, estimate a plausible shape (aspect ratio
+  // dim/layers ~ 128, P ~ 12 * L * D^2) so the activation and KV-cache numbers
+  // below are not silently computed for a tiny model.
+  double layers = a.num("layers", 0.0);
+  double dim = a.num("dim", 0.0);
+  bool estimated = false;
+  if (layers <= 0.0 || dim <= 0.0) {
+    if (a.has("params")) {
+      layers = std::max(2.0, std::cbrt(P / 196608.0));
+      dim = 128.0 * layers;
+      estimated = true;
+    } else {
+      layers = static_cast<double>(g.n_layer);
+      dim = static_cast<double>(g.n_embd);
+    }
+  }
+  const double heads = a.num("heads", std::max(1.0, std::round(dim / 128.0)));
+  const double kv_heads = a.num("kv-heads", heads);
+  const double head_dim = dim / std::max(1.0, heads);
+
+  const double ram = a.num("ram", 16.0) * 1073741824.0;
+  const double vram = a.num("vram", 2.0) * 1073741824.0;
+  const double gpu = a.num("gpu-mem", 80.0) * 1073741824.0;
+  const double flops = a.num("throughput", 4e14);  // achieved FLOP/s of one accelerator
+  const double trainable_frac = std::min(1.0, std::max(0.0, a.num("trainable", 1.0)));
+
+  auto human = [](double b) { return human_bytes(b); };
+  std::printf("parameters\n");
+  std::printf("  total            : %.4g  (%.2f B)\n", P, P / 1e9);
+  if (experts > 1.0) {
+    std::printf("  MoE              : %.0f experts, top-%.0f routing, %.0f%% of params in experts\n",
+                experts, topk, 100.0 * expert_share);
+    std::printf("  active per token : %.4g  (%.2f B, %.1f%% of total)\n", active, active / 1e9,
+                100.0 * active / P);
+  }
+  const double trainable = P * trainable_frac;
+  std::printf("  trainable        : %.4g  (%.0f%%)\n", trainable, 100.0 * trainable_frac);
+  std::printf("  shape%s          : %.0f layers x %.0f dim, %.0f heads (%.0f kv heads), ctx %lld\n",
+              estimated ? " (est.)" : "      ", layers, dim, heads, kv_heads,
+              static_cast<long long>(ctx));
+
+  std::printf("\nweights\n");
+  std::printf("  fp32             : %s\n", human(P * 4).c_str());
+  std::printf("  fp16/bf16        : %s\n", human(P * 2).c_str());
+  std::printf("  int8 (group 64)  : %s\n", human(P * 1.0625).c_str());
+  std::printf("  int4 (group 64)  : %s\n", human(P * 0.5625).c_str());
+
+  const double grads = trainable * 2;          // bf16 grads
+  const double adam = trainable * 8;           // fp32 m+v
+  const double adam8 = trainable * 2;          // 8-bit optimiser states
+  const double act_full = static_cast<double>(batch) * ctx * dim * layers * 12.0 * 2.0;
+  const double act_ckpt = static_cast<double>(batch) * ctx * dim * (layers + 12.0) * 2.0;
+  const double kv = 2.0 * layers * kv_heads * head_dim * static_cast<double>(ctx) *
+                    static_cast<double>(batch) * 2.0;
+  std::printf("\ntraining state (bf16 weights, %s)\n", trainable_frac < 1.0 ? "partial fine-tune" : "full");
+  std::printf("  weights          : %s\n", human(P * 2).c_str());
+  std::printf("  gradients        : %s\n", human(grads).c_str());
+  std::printf("  AdamW fp32       : %s   (8-bit: %s)\n", human(adam).c_str(), human(adam8).c_str());
+  std::printf("  activations      : %s   (checkpointing: %s)\n", human(act_full).c_str(),
+              human(act_ckpt).c_str());
+  const double train_min = P * 2 + grads + adam8 + act_ckpt;
+  const double train_max = P * 2 + grads + adam + act_full;
+  std::printf("  total            : %s .. %s\n", human(train_min).c_str(), human(train_max).c_str());
+  std::printf("\ninference (batch %lld, ctx %lld)\n", static_cast<long long>(batch),
+              static_cast<long long>(ctx));
+  std::printf("  weights int8     : %s\n", human(P * 1.0625).c_str());
+  std::printf("  KV cache fp16    : %s\n", human(kv).c_str());
+  std::printf("  total int8       : %s\n", human(P * 1.0625 + kv).c_str());
+
+  std::printf("\nverdict for your machine (--ram %.0f GiB, --vram %.0f GiB)\n", ram / 1073741824.0,
+              vram / 1073741824.0);
+  auto verdict = [](bool ok) { return ok ? "FITS" : "does NOT fit"; };
+  std::printf("  train (min config) in RAM   : %-13s (needs %s)\n", verdict(train_min <= ram),
+              human(train_min).c_str());
+  std::printf("  train (min config) in VRAM  : %-13s (needs %s)\n", verdict(train_min <= vram),
+              human(train_min).c_str());
+  std::printf("  int8 inference in RAM       : %-13s (needs %s)\n",
+              verdict(P * 1.0625 + kv <= ram), human(P * 1.0625 + kv).c_str());
+  std::printf("  int8 inference in VRAM      : %-13s (needs %s)\n",
+              verdict(P * 1.0625 + kv <= vram), human(P * 1.0625 + kv).c_str());
+  const double per_gpu_train = train_min;
+  const int gpus_train = static_cast<int>(std::ceil(per_gpu_train / gpu));
+  const int gpus_infer = static_cast<int>(std::ceil((P * 2 + kv) / gpu));
+  std::printf("  accelerators of %.0f GiB     : %d for sharded training, %d for fp16 inference\n",
+              gpu / 1073741824.0, gpus_train, gpus_infer);
+
+  const double tokens = a.num("tokens", 20.0 * P);  // Chinchilla-ish
+  const double train_flops = 6.0 * active * tokens;
+  const double secs = train_flops / std::max(1.0, flops);
+  std::printf("\ncompute for a from-scratch run\n");
+  std::printf("  tokens (20x params): %.3g\n", tokens);
+  std::printf("  training FLOPs     : %.3g   (6 x active params x tokens)\n", train_flops);
+  std::printf("  one accelerator at %.2g FLOP/s: %.3g s  =  %.3g GPU-years\n", flops, secs,
+              secs / (3600.0 * 24.0 * 365.0));
+  std::printf("  1000 accelerators  : %.3g days\n", secs / 1000.0 / 86400.0);
+  const double cpu_flops = 5.8e10;  // measured for the bundled native backend
+  std::printf("  this CPU backend (%.1e FLOP/s): %.3g years\n", cpu_flops,
+              train_flops / cpu_flops / (3600.0 * 24.0 * 365.0));
+
+  const double budget = std::min(ram, vram > 0 ? std::max(ram, vram) : ram);
+  const double fit_params_train = budget / (2 + 2 + 2);  // bf16 w + grads + 8-bit adam
+  const double fit_params_infer = budget / 1.0625;
+  std::printf("\nwhat actually fits here\n");
+  std::printf("  full training      : up to ~%.2f B parameters (bf16 + 8-bit optimiser,\n"
+              "                       checkpointing, micro-batch 1)\n", fit_params_train / 1e9);
+  std::printf("  int8 inference     : up to ~%.2f B parameters\n", fit_params_infer / 1e9);
+  std::printf("  partial fine-tune  : a %.2f B model with 5%% trainable needs %s\n",
+              fit_params_infer / 1e9,
+              human(fit_params_infer * 2 + fit_params_infer * 0.05 * 4 + act_ckpt).c_str());
   return 0;
 }
 
@@ -553,15 +905,17 @@ int main(int argc, char** argv) {
     if (cmd == "pretrain") return cmd_pretrain(a);
     if (cmd == "chat") return cmd_chat(a);
     if (cmd == "eval") return cmd_eval(a);
+    if (cmd == "langcheck") return cmd_langcheck(a);
     if (cmd == "quantize") return cmd_quantize(a);
     if (cmd == "bench") return cmd_bench(a);
+    if (cmd == "plan") return cmd_plan(a);
     if (cmd == "live" || cmd == "dashboard") {
       AppOptions o;
       if (a.has("config")) o.cfg.load(a.str("config"));
       a.apply_sets(&o.cfg);
       o.ckpt = a.str("ckpt");
       o.tokenizer = a.str("tokenizer");
-      o.data = a.str("data");
+      o.data = a.has("mix") ? a.str("mix") : a.str("data");
       o.workdir = a.str("workdir", "runs");
       o.headless = (cmd == "live") || a.flag("headless");
       o.seconds = a.num("seconds", 0.0);

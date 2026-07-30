@@ -64,6 +64,8 @@ cmake --build "$BUILD_DIR" -j "$JOBS"
 if [[ "$TESTS" == 1 ]]; then
   echo "==> gradient checks"
   "$BUILD_DIR/slm_gradcheck"
+  echo "==> text / tokenizer checks"
+  "$BUILD_DIR/slm_texttest"
 fi
 
 echo

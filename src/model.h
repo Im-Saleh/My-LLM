@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Decoder-only transformer (GPT-2 / nanoGPT style), written against the
-// backend-agnostic tensor facade.
+// Decoder-only transformer, written against the backend-agnostic tensor facade.
 //
-//   token emb + learned pos emb
-//   N x [ pre-LN -> causal MHSA -> residual ; pre-LN -> MLP(4x, GELU) -> residual ]
-//   final LN -> lm head (optionally tied to the token embedding)
+// Two architecture families are supported by the same code, selected in the
+// config file:
 //
-// Extras that the self-training system depends on:
+//   legacy  (GPT-2 / nanoGPT)         modern  (Llama / Qwen / DeepSeek style)
+//   ------------------------------    ---------------------------------------
+//   learned positional embeddings     RoPE (rotary), extrapolates, no table
+//   LayerNorm (gain + bias)           RMSNorm (gain only, cheaper, stabler)
+//   MLP 4x with GELU                  SwiGLU (gate * up, 8/3x hidden)
+//   multi-head attention              grouped-query attention (n_kv_head)
+//   biases on every linear            no biases
+//
+// The modern stack is the default because it is what every current model of
+// this shape uses: better quality per parameter, a much smaller KV cache (GQA)
+// and no context-length ceiling baked into a weight matrix.
+//
+// Extras the self-training system depends on:
 //   * per-parameter freezing (partial fine-tuning),
 //   * optional gradient checkpointing per block,
 //   * a KV cache so interactive generation is O(1) per token,
@@ -28,20 +38,35 @@ namespace slm {
 
 class Config;
 
+enum class NormKind : uint8_t { kLayerNorm = 0, kRMSNorm = 1 };
+enum class PosKind : uint8_t { kLearned = 0, kRoPE = 1 };
+enum class FFNKind : uint8_t { kGeluMLP = 0, kSwiGLU = 1 };
+
 struct GPTConfig {
   int32_t vocab_size = 4096;
   int64_t n_layer = 6;
   int64_t n_head = 6;
+  int64_t n_kv_head = 0;  // 0 or == n_head -> MHA, otherwise GQA
   int64_t n_embd = 384;
   int64_t block_size = 256;
+  int64_t ffn_hidden = 0;  // 0 -> automatic (4C for GELU, ~8/3 C for SwiGLU)
   bool tie_weights = true;
   bool grad_checkpointing = false;
   float init_std = 0.02f;
   float ln_eps = 1e-5f;
+  NormKind norm = NormKind::kRMSNorm;
+  PosKind pos = PosKind::kRoPE;
+  FFNKind ffn = FFNKind::kSwiGLU;
+  bool linear_bias = false;  // modern stacks drop biases
+  float rope_theta = 10000.0f;
 
   int64_t param_count() const;
   int64_t head_dim() const { return n_embd / n_head; }
+  int64_t kv_heads() const { return n_kv_head > 0 ? n_kv_head : n_head; }
+  int64_t kv_repeat() const { return n_head / kv_heads(); }
+  int64_t hidden_dim() const;
   std::string describe() const;
+  std::string arch_summary() const;
   static GPTConfig from_config(const Config& c);
   void write_to(Config& c) const;
   void validate() const;
@@ -49,12 +74,11 @@ struct GPTConfig {
 
 // Which parameters a given trainer is allowed to move.
 struct FreezePolicy {
-  // -1 == all layers trainable, otherwise only the last `last_k_blocks`.
-  int last_k_blocks = -1;
+  int last_k_blocks = -1;  // -1 == every block
   bool train_embeddings = true;
   bool train_head = true;
   bool train_final_ln = true;
-  bool layernorms_only = false;  // strongest restriction: only LN gains/biases
+  bool layernorms_only = false;
   static FreezePolicy all() { return FreezePolicy{}; }
   static FreezePolicy last_k(int k, bool head = true) {
     FreezePolicy p;
@@ -76,15 +100,16 @@ struct AttentionCapture {
   }
 };
 
-// Incremental decoding state.
+// Incremental decoding state (sized for the *kv* heads, which is what makes
+// GQA cheap at inference time).
 struct KVCache {
   int64_t B = 0, H = 0, D = 0, Tmax = 0, T = 0;
   std::vector<std::vector<float>> k, v;  // per layer, [B, H, Tmax, D]
   void reset(int64_t B, int64_t H, int64_t D, int64_t Tmax, int64_t n_layer);
   void clear() { T = 0; }
+  size_t bytes() const;
 };
 
-// Options for a single forward pass.
 struct ForwardOptions {
   int64_t pos_offset = 0;
   KVCache* cache = nullptr;
@@ -92,7 +117,6 @@ struct ForwardOptions {
   bool checkpointing = false;
 };
 
-// Sampling configuration.
 struct GenOptions {
   int max_new_tokens = 64;
   float temperature = 0.9f;
@@ -103,11 +127,9 @@ struct GenOptions {
   bool stop_on_eot = true;
 };
 
-// One decoding step, streamed to the caller (GUI / CLI).
 struct GenStep {
   int32_t token = 0;
   float logprob = 0.0f;
-  // Highest probability candidates of this step (for the GUI panel).
   std::vector<std::pair<int32_t, float>> top;
 };
 
@@ -120,7 +142,6 @@ class GPT {
 
   void init_weights(uint64_t seed);
 
-  // ---------------------------------------------------------------- params
   const std::vector<std::string>& param_names() const { return order_; }
   Tensor* param(const std::string& name);
   const Tensor* param(const std::string& name) const;
@@ -136,30 +157,20 @@ class GPT {
   ParamStorePtr snapshot() const;
   void load_params(const ParamStore& s);
 
-  // --------------------------------------------------------------- forward
-  // ids: B*T token ids -> logits [B,T,V]
   Tensor forward(const std::vector<int32_t>& ids, int64_t B, int64_t T,
                  const ForwardOptions& opt = ForwardOptions());
 
-  // Cross-entropy over `targets` (use -100 to ignore a position).
   Tensor loss(const std::vector<int32_t>& ids, const std::vector<int32_t>& targets,
               int64_t B, int64_t T, float* loss_out = nullptr,
               int64_t* ntok_out = nullptr, bool checkpointing_default = true);
 
-  // Mean cross-entropy without building a graph (validation / gating).
   float eval_loss(const std::vector<int32_t>& ids, const std::vector<int32_t>& targets,
                   int64_t B, int64_t T);
 
-  // --------------------------------------------------------------- sampling
-  // Returns the generated continuation (prompt excluded).  `on_step` may
-  // return false to abort generation (used by Emergency Stop).
-  std::vector<int32_t> generate(const std::vector<int32_t>& prompt,
-                                const GenOptions& opt,
+  std::vector<int32_t> generate(const std::vector<int32_t>& prompt, const GenOptions& opt,
                                 const std::function<bool(const GenStep&)>& on_step = nullptr,
                                 AttentionCapture* capture = nullptr);
 
-  // Sum of log p(target) for a full sequence, no graph (used for quality
-  // filtering and reward computation).
   float sequence_logprob(const std::vector<int32_t>& ids, int64_t* ntok = nullptr);
 
  private:

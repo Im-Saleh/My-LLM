@@ -11,7 +11,9 @@ namespace slm {
 struct AppOptions {
   std::string ckpt;       // base checkpoint (required)
   std::string tokenizer;  // tokenizer file (required)
-  std::string data;       // corpus used for replay + hold-out gating
+  // Corpus for replay + per-language hold-out gating.  Either a single file or
+  // a mixture spec:  "fa=data/fa.txt:0.35,en=data/en.txt:0.35,py=data/py.txt:0.30"
+  std::string data;
   std::string workdir = "runs";
   bool headless = false;  // terminal dashboard instead of ImGui
   double seconds = 0.0;   // auto-exit after N seconds (0 = run forever)

@@ -11,13 +11,17 @@ GUI=1
 if command -v apt-get >/dev/null; then
   apt-get update
   apt-get install -y build-essential cmake git python3 libgomp1
-  [[ $GUI == 1 ]] && apt-get install -y libglfw3-dev libgl1-mesa-dev xorg-dev
+  [[ $GUI == 1 ]] && apt-get install -y libglfw3-dev libgl1-mesa-dev xorg-dev \
+      libfreetype-dev libharfbuzz-dev fonts-vazirmatn || true
+  # Persian rendering needs a font with Arabic shaping tables.
+  [[ $GUI == 1 ]] && apt-get install -y fonts-noto-core || true
 elif command -v dnf >/dev/null; then
   dnf install -y gcc-c++ cmake git python3 libgomp
   [[ $GUI == 1 ]] && dnf install -y mesa-libGL-devel libX11-devel libXrandr-devel \
-      libXinerama-devel libXcursor-devel libXi-devel
+      libXinerama-devel libXcursor-devel libXi-devel freetype-devel harfbuzz-devel \
+      google-noto-naskh-arabic-fonts google-noto-sans-arabic-fonts
 elif command -v pacman >/dev/null; then
-  pacman -Sy --noconfirm base-devel cmake git python glfw mesa
+  pacman -Sy --noconfirm base-devel cmake git python glfw mesa freetype2 harfbuzz noto-fonts
 elif command -v zypper >/dev/null; then
   zypper install -y gcc-c++ cmake git python3 Mesa-libGL-devel libX11-devel
 else

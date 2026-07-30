@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include "gui_text.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -41,11 +42,81 @@ namespace slm {
 namespace {
 
 const ImU32 kColors[kNumStreams] = {
-    IM_COL32(90, 170, 255, 255),   // continual  - blue
-    IM_COL32(255, 200, 80, 255),   // self-gen   - amber
-    IM_COL32(220, 120, 255, 255),  // feedback   - violet
-    IM_COL32(110, 230, 140, 255),  // holdout    - green
+    IM_COL32(90, 170, 255, 255),   // continual   - blue
+    IM_COL32(255, 200, 80, 255),   // self-gen    - amber
+    IM_COL32(220, 120, 255, 255),  // feedback    - violet
+    IM_COL32(110, 230, 140, 255),  // holdout all - green
+    IM_COL32(255, 130, 130, 255),  // holdout fa  - red
+    IM_COL32(150, 220, 255, 255),  // holdout en  - light blue
+    IM_COL32(200, 255, 150, 255),  // holdout py  - lime
 };
+
+ShapedText g_shaper;
+
+// Draws one line of text, using the Persian shaper when the string contains
+// Arabic script.  Falls back to plain ImGui text otherwise (and when the
+// shaper is unavailable), so the dashboard never depends on it.
+void ui_line(const std::string& s, const ImVec4* color = nullptr) {
+  if (s.empty()) {
+    ImGui::TextUnformatted("");
+    return;
+  }
+  if (g_shaper.ready() && needs_shaping(s)) {
+    const ShapedText::Image* img = g_shaper.image(s);
+    if (img && img->texture) {
+      const ImVec4 tint = color ? *color : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+      ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(img->texture)),
+                   ImVec2(static_cast<float>(img->width), static_cast<float>(img->height)),
+                   ImVec2(0, 0), ImVec2(1, 1), tint);
+      return;
+    }
+  }
+  if (color)
+    ImGui::TextColored(*color, "%s", s.c_str());
+  else
+    ImGui::TextUnformatted(s.c_str());
+}
+
+// Word-wrapped variant: shaped strings are measured word by word so a long
+// Persian answer wraps like any other paragraph.
+void ui_wrapped(const std::string& text, const ImVec4* color = nullptr) {
+  const float avail = ImGui::GetContentRegionAvail().x - 4.0f;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t nl = text.find('\n', start);
+    const std::string line =
+        text.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+    if (!g_shaper.ready() || !needs_shaping(line)) {
+      if (color)
+        ImGui::TextColored(*color, "%s", line.c_str());
+      else
+        ImGui::TextWrapped("%s", line.c_str());
+    } else if (g_shaper.measure(line) <= avail) {
+      ui_line(line, color);
+    } else {
+      // greedy word wrapping
+      std::string cur;
+      size_t i = 0;
+      while (i < line.size()) {
+        const size_t sp = line.find(' ', i);
+        const std::string word =
+            line.substr(i, sp == std::string::npos ? std::string::npos : sp - i);
+        const std::string candidate = cur.empty() ? word : cur + " " + word;
+        if (!cur.empty() && g_shaper.measure(candidate) > avail) {
+          ui_line(cur, color);
+          cur = word;
+        } else {
+          cur = candidate;
+        }
+        if (sp == std::string::npos) break;
+        i = sp + 1;
+      }
+      if (!cur.empty()) ui_line(cur, color);
+    }
+    if (nl == std::string::npos) break;
+    start = nl + 1;
+  }
+}
 
 void glfw_error(int code, const char* msg) {
   std::fprintf(stderr, "glfw error %d: %s\n", code, msg);
@@ -195,7 +266,7 @@ void token_panel(Telemetry& tel) {
     ImGui::ProgressBar(p, ImVec2(-120, 0), label);
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ImGui::Text("%s", d.labels[i].c_str());
+    ui_line(d.labels[i]);
   }
 }
 
@@ -265,10 +336,10 @@ void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
     ImGui::PushID(static_cast<int>(i));
     ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "you:");
     ImGui::SameLine();
-    ImGui::TextWrapped("%s", h[i].prompt.c_str());
+    ui_wrapped(h[i].prompt);
     ImGui::TextColored(ImVec4(0.65f, 0.95f, 0.7f, 1.0f), "slm:");
     ImGui::SameLine();
-    ImGui::TextWrapped("%s", h[i].response.c_str());
+    ui_wrapped(h[i].response);
     ImGui::TextDisabled("%d tokens, %.1f tok/s", h[i].tokens, h[i].tokens_per_s);
     ImGui::SameLine();
     if (h[i].rated) {
@@ -288,7 +359,8 @@ void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
   if (!partial.empty()) {
     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "slm:");
     ImGui::SameLine();
-    ImGui::TextWrapped("%s", partial.c_str());
+    const ImVec4 amber(1.0f, 0.85f, 0.4f, 1.0f);
+    ui_wrapped(partial, &amber);
   }
   if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
   ImGui::EndChild();
@@ -301,6 +373,11 @@ void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
   if ((enter || send) && input[0] != '\0') {
     ctx.chat->ask(input);
     input[0] = '\0';
+  }
+  if (input[0] != '\0' && needs_shaping(input)) {
+    ImGui::TextDisabled("preview:");
+    ImGui::SameLine();
+    ui_line(input);  // the input widget itself cannot shape Persian
   }
   ImGui::TextDisabled(
       "rating a reply feeds the feedback (DPO) thread; every message also feeds "
@@ -352,7 +429,23 @@ int run_imgui_dashboard(DashboardContext& ctx) {
     if (io.Fonts->AddFontFromFileTTF(path, 17.0f)) break;
   }
 
-  bool visible[kNumStreams] = {true, true, true, true};
+  // The shaper needs a live GL context, so it is initialised here.
+  {
+    std::vector<std::string> fonts;
+    if (ctx.opt && !ctx.opt->cfg.get_str("gui.font", "").empty())
+      fonts.push_back(ctx.opt->cfg.get_str("gui.font", ""));
+    if (g_shaper.init(fonts, 18.0f))
+      std::printf("persian text shaping: %s  (latin fallback: %s)\n",
+                  g_shaper.font().c_str(),
+                  g_shaper.latin_font().empty() ? "none" : g_shaper.latin_font().c_str());
+    else
+      std::printf("persian text shaping unavailable (%s)\n",
+                  text_shaping_compiled() ? "no suitable font found"
+                                          : "built without freetype/harfbuzz");
+  }
+
+  bool visible[kNumStreams] = {};
+  for (int i = 0; i < kNumStreams; ++i) visible[i] = true;
   bool log_scale = false;
   float window_seconds = 180.0f;
   int layer = 0, head = 0;
@@ -441,16 +534,14 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                             ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(col_w, (disp.y - 62) * 0.45f), ImGuiCond_Always);
     ImGui::Begin("audit log", nullptr, ImGuiWindowFlags_NoMove);
-    for (const std::string& l : ctx.tel->recent_logs(200)) {
+    for (const std::string& l : ctx.tel->recent_logs(120)) {
       ImVec4 col(0.75f, 0.75f, 0.8f, 1.0f);
       if (l.find(" accept ") != std::string::npos) col = ImVec4(0.5f, 0.95f, 0.6f, 1.0f);
       else if (l.find(" reject ") != std::string::npos) col = ImVec4(1.0f, 0.6f, 0.5f, 1.0f);
       else if (l.find(" warn ") != std::string::npos) col = ImVec4(1.0f, 0.85f, 0.4f, 1.0f);
       else if (l.find(" error ") != std::string::npos) col = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
       else if (l.find(" augment ") != std::string::npos) col = ImVec4(0.6f, 0.85f, 1.0f, 1.0f);
-      ImGui::PushStyleColor(ImGuiCol_Text, col);
-      ImGui::TextWrapped("%s", l.c_str());
-      ImGui::PopStyleColor();
+      ui_wrapped(l, &col);
     }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
     ImGui::End();

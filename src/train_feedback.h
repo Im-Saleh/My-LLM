@@ -35,6 +35,14 @@ namespace slm {
 struct FeedbackConfig {
   float dpo_beta = 0.1f;
   float sft_weight = 0.25f;
+  // Every feedback round also replays the base corpus in *all* languages.  Even
+  // if 100% of the ratings arrive in Persian, the gradient still contains
+  // English and Python, so the preference signal cannot quietly delete a
+  // language.  (The coordinator's per-language gate is the second line of
+  // defence.)
+  float replay_weight = 0.5f;
+  int replay_batches = 0;      // 0 -> one batch per corpus source
+  bool balance_languages = true;
   float good_score = 3.5f;      // >= this is "preferred" for reward weighting
   float min_score_gap = 0.5f;   // minimum gap to form a preference pair
   int max_pairs_per_round = 4;
@@ -49,7 +57,7 @@ class FeedbackTrainer : public TrainerBase {
   FeedbackTrainer(Coordinator* coord, Telemetry* tel, InteractionHub* hub,
                   const GPTConfig& mcfg, const TrainerConfig& tcfg,
                   const FeedbackConfig& fcfg, const Tokenizer* tok,
-                  const TokenDataset* corpus, uint64_t seed);
+                  const MixtureDataset* corpus, uint64_t seed);
 
  protected:
   bool ready() override;
@@ -60,6 +68,7 @@ class FeedbackTrainer : public TrainerBase {
     std::vector<int32_t> ids;  // prompt + response
     size_t response_start = 0;
     float score = 0.0f;
+    Lang lang = Lang::kUnknown;
     std::string response;
   };
   struct Pair {
@@ -82,6 +91,8 @@ class FeedbackTrainer : public TrainerBase {
   int64_t bank_items_ = 0;
   int64_t pairs_total_ = 0;
   int64_t rwft_total_ = 0;
+  int64_t ratings_lang_[kNumLangs] = {};
+  int64_t pairs_lang_[kNumLangs] = {};
 };
 
 }  // namespace slm
