@@ -9,9 +9,11 @@ run/
 runs/
 *.slm
 *.slmtok
+*.slmq
 *.jsonl
 !models/*.slm
 !models/*.slmtok
+!models/*.slmq
 data/*.txt
 data/raw/
 data/tokens/

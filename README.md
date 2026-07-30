@@ -144,6 +144,7 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 | [`docs/MULTILINGUAL.fa.md`](docs/MULTILINGUAL.fa.md) | **استراتژی توکنایزر، ترکیب دیتاست با درصد، پلن آموزش مرحله‌ای، ارزیابی** + منابع فارسی/کد |
 | [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | توضیح فنی دقیق coordinator و ترکیب سه منبع آپدیت |
 | [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | نمای کلی معماری، نمودار، همزمانی، بودجه‌ی حافظه |
+| [`docs/QUANTIZATION.fa.md`](docs/QUANTIZATION.fa.md) | **int4/int8 + mmap: اجرای مدل ۲ میلیارد پارامتری** روی همین سخت‌افزار |
 | [`docs/SCALING.fa.md`](docs/SCALING.fa.md) | **۷ تریلیون پارامتر: اعداد واقعی** و نردبان اندازه‌های عملی |
 | [`docs/TEACHING.fa.md`](docs/TEACHING.fa.md) | **چطور به مدل چیز یاد بدهم** — چهار سطح یادگیری، از حافظه تا fine-tune |
 | [`docs/STEP_BY_STEP.fa.md`](docs/STEP_BY_STEP.fa.md) | پیاده‌سازی گام‌به‌گام |
@@ -197,8 +198,63 @@ step   600 | loss 5.6823 | lr 6.82e-05 | 4.92M tok | 13.990M par
 | آموزش | ۴۲۷۰ tok/s (libtorch CPU) / ~۱۸۰۰ tok/s (بومی) برای همین مدل |
 | تولید با KV-cache | ۳۰–۸۵ tok/s روی CPU |
 | checkpointing | فعال‌سازی ۴۳۲MiB → ۹۰MiB |
-| کوانتیزاسیون | fp16 نصف (خطای RMS ۰.۰۱۸٪)، int8 گروهی ~۳.۹ برابر کوچک‌تر |
+| کوانتیزاسیون ذخیره‌سازی | fp16 نصف (خطای RMS ۰.۰۱۸٪)، int8 گروهی ~۳.۹ برابر کوچک‌تر |
+| **استقرار int4 (`.slmq`)** | همین مدل ۷.۲MB (۷.۵ برابر کوچک‌تر) با **+۰.۱۵٪ perplexity** |
+| **مدل ۱.۹۳B پارامتری** | ۹۹۰MiB فایل، **۲۶–۲۹ tok/s** روی ۸ هسته، ~۱GB RSS |
+| تست کوانتیزاسیون | **۳۳/۳۳** (کرنل‌های صحیح، ظرف mmap، تطابق سرتاسری با مسیر f32) |
 | کد از دستور فارسی | ۱۰۰٪ خروجی‌های پایتون از فیلتر ساختاری رد می‌شوند |
+
+---
+
+## استقرار: int4 + mmap (اجرای ۲ میلیارد پارامتر)
+
+مسیر آموزش با float32 و autograd کار می‌کند؛ مسیر **اجرا** یک موتور جداگانه دارد که
+وزن‌ها را از یک فایل `.slmq` **memory-map** می‌کند و ضرب‌ها را با دستورات **صحیح**
+(`vpmaddubsw`/`vpmaddwd`) می‌زند — الگوی PicoLM/llama.cpp. هیچ وزن شناوری ساخته نمی‌شود.
+
+```bash
+./build/slm pack  --in models/demo-fa.slm --out fa-q4.slmq --bits 4
+./build/slm qrun  --model fa-q4.slmq --tokenizer models/demo-fa.slmtok \
+                  --prompt "ایران کشوری است که" --max-new 60
+./build/slm qeval --model fa-q4.slmq --tokenizer models/demo-fa.slmtok \
+                  --data data/fa.txt --tail --ckpt models/demo-fa.slm   # هزینه‌ی دقیق کوانتیزاسیون
+```
+
+روی همان مدل فارسی ۱۳.۹۹M و همان توکن‌ها:
+
+| فرمت | حجم | بیت بر وزن | perplexity | هزینه |
+|---|---|---|---|---|
+| f32 | ۵۴ MB | ۳۲.۰۰ | ۱۵۹.۶۴ | — |
+| f16 | ۲۷ MB | ۱۶.۰۱ | ۱۵۹.۶۴ | ۰.۰۰٪ |
+| q8 | ۱۴ MB | ۸.۲۶ | ۱۵۹.۶۹ | +۰.۰۳٪ |
+| **q4** | **۷.۲ MB** | **۴.۲۶** | ۱۶۳.۲۴ | **+۲.۳٪** |
+
+decode یک عملیات **memory-bound** است، پس بایت کم‌تر یعنی سرعت بیش‌تر. مدل ۱۴M در کش
+CPU جا می‌شود و تفاوتی نشان نمی‌دهد، ولی از جایی که مدل از کش بیرون بزند:
+
+| مدل ۶۱۶M | حجم | decode | prefill |
+|---|---|---|---|
+| f16 | ۱.۱۵ GiB | ۳۲.۲ tok/s | ۵۸ tok/s |
+| **q4** | ۳۱۳ MiB | **۷۷.۲ tok/s** | **۱۵۰ tok/s** |
+
+و مدل بزرگ، ساخته‌شده **بدون** اینکه هیچ‌وقت نسخه‌ی f32 آن (۷.۲GiB) وجود داشته باشد:
+
+```bash
+./build/slm pack --synth --dim 2560 --layers 28 --heads 20 --kv-heads 4 \
+                 --vocab 8192 --ctx 2048 --bits 4 --out big-2b-q4.slmq
+./build/slm qbench --model big-2b-q4.slmq --prompt-len 32 --gen 8 --cold
+```
+
+```
+QModel(28L x 2560d, vocab 8192, ctx 2048, qknorm+rmsnorm+rope+swiglu+gqa20:4)
+  1934.12M params, q4, 4.296 bits/weight, 990.42 MiB file
+  اوج RAM هنگام ساخت: 5.1 MB      (نسخه‌ی f32 همین مدل: 7.21 GiB)
+  decode: 26–29 tok/s (35–39 ms/token)، پهنای باند مؤثر ~۲۷–۳۰ GB/s، RSS ~۱.۰GB
+  اولین توکن سرد: ۶.۹ ثانیه (۹۹۰MB از دیسک)، KV cache در ctx=2048: ۱۱۷MB
+```
+
+جزئیات کامل (چیدمان گروه‌های ۶۴تایی، تصحیح `−8·Σa`، کنترل سرریز int16، جست‌وجوی
+مقیاس، فرمت ظرف): [`docs/QUANTIZATION.fa.md`](docs/QUANTIZATION.fa.md).
 
 ---
 
@@ -303,9 +359,14 @@ slm chat        --ckpt F --tokenizer F [--prompt S]      تولید تعاملی
 slm eval        --ckpt F --tokenizer F --mix ...         loss/ppl/BPC هر زبان
 slm langcheck   --ckpt F --tokenizer F --mix ...         تداخل زبانی + اعتبار کد
 slm quantize    --in F --out F [--dtype q8|f16|f32]      تبدیل چک‌پوینت
+slm pack        --in F.slm --out F.slmq [--bits 4|8]     ساخت فایل mmap شدنی int4/int8
+slm pack        --synth --dim N --layers N --bits 4      ساخت مستقیم مدل بزرگ روی دیسک
+slm qrun        --model F.slmq --tokenizer F [--prompt S]  اجرا با کرنل صحیح (بدون وزن شناور)
+slm qbench      --model F.slmq [--gen N] [--cold]        توان عبوری + حافظه‌ی واقعی
+slm qeval       --model F.slmq --data F [--ckpt F.slm]   کیفیت کوانتیزه در برابر f32
 slm bench       [--config F] [--batch N]                 توان عبوری
 slm live        / slm dashboard                          سیستم کامل + داشبورد
-slm_gradcheck   / slm_texttest                           تست‌ها
+slm_gradcheck   / slm_texttest / slm_qtest                تست‌ها
 ```
 
 هر کلید کانفیگ از خط فرمان هم قابل تنظیم است: `--set coord.ties_keep=0.2`.
@@ -339,7 +400,10 @@ model.n_kv_head = 2       model.rope_theta = 10000    model.linear_bias = false
   + checkpointing؛ روی CPU محدودیت زمان است نه حافظه).
 * **fine-tune جزئی** (دو بلوک آخر + head) یک مدل ~۱–۳B را روی ۲GB VRAM ممکن می‌کند —
   همان حالتی که سه ترد خودآموزی در آن کار می‌کنند.
-* **inference int8** تا ~۱.۸B روی ۲GB VRAM و تا ~۱۶B روی ۱۶GB RAM.
+* **inference int4 (پیاده‌شده و اندازه‌گیری‌شده)**: مدل **۱.۹۳B** در یک فایل ۹۹۰MiB،
+  ۲۶–۲۹ tok/s روی ۸ هسته CPU و ~۱GB RSS. با int8 حدود نصف این اندازه مدل، و روی
+  ۱۶GB RAM تا ~۳۰B پارامتر در int4 صرفاً از نظر *حجم* جا می‌شود (سرعتش کند است).
+  → [`docs/QUANTIZATION.fa.md`](docs/QUANTIZATION.fa.md)
 * **۷ تریلیون پارامتر**: ~۳۸TB حالت آموزش و ~۴۹۰ کارت ۸۰گیگی — روی این سخت‌افزار
   ممکن نیست. جزئیات و نردبان کامل: [`docs/SCALING.fa.md`](docs/SCALING.fa.md).
 
@@ -353,6 +417,8 @@ src/
   core/tensor_native.cpp   autograd بومی + RoPE/RMSNorm/SwiGLU/GQA + checkpointing
   core/tensor_torch.cpp    بکند libtorch (همان façade)
   core/gemm.{h,cpp}        SGEMM با AVX2/FMA + OpenMP و انتخاب در زمان اجرا
+  core/quant.{h,cpp}       کوانتیزاسیون گروهی int4/int8 + کرنل‌های صحیح AVX2
+  qmodel.{h,cpp}           موتور اجرای فایل mmap شده‌ی .slmq (بدون وزن شناور)
   core/text.{h,cpp}        UTF-8، نرمال‌سازی فارسی، تشخیص زبان، بررسی پایتون
   core/dataset.{h,cpp}     TokenDataset + MixtureDataset (وزن‌دار، holdout هر زبان)
   core/{optim,serialize,params,config,rng}.*
@@ -362,7 +428,7 @@ src/
   trainer.{h,cpp} train_continual.* train_selfgen.* train_feedback.*
   telemetry.* chat.* app.* main.cpp
   gui.cpp gui_text.{h,cpp} gui_terminal.cpp    داشبورد + shaping فارسی
-  tests/gradcheck.cpp tests/text_test.cpp
+  tests/gradcheck.cpp tests/text_test.cpp tests/quant_test.cpp
 configs/  slm-tiny | slm-demo | slm-124m
 scripts/  install_deps | make_trilingual_data | make_sample_data | fetch_data | quickstart | make_deb
 models/   demo-tri.slm (fp16، آموزش‌دیده) + demo-tri.slmtok
@@ -374,7 +440,12 @@ models/   demo-tri.slm (fp16، آموزش‌دیده) + demo-tri.slmtok
   ارزیابی خودکار ممکن باشد). برای مدل واقعی منابع بخش ۲ سند MULTILINGUAL را بگیر.
   به همین دلیل vocab روی ~۲k اشباع می‌شود و مدل ۷M در حساب ضعیف است.
 * **MoE و شاردینگ چند-دستگاهی پیاده نشده‌اند** (در `slm plan` مدل‌سازی شده‌اند).
-* int8 فعلاً فقط در لایه‌ی ذخیره‌سازی است، ضرب ماتریسی int8 نه.
+* کرنل int4/int8 فقط روی CPU است (AVX2؛ با fallback اسکالر). فایل ۹۹۰MB مدل ۲B در
+  ۲GB VRAM جا می‌شود اما کرنل صحیح روی GPU نوشته نشده.
+* کوانتیزاسیون **وزن‌محور** است: calibration ثابت (AWQ/SmoothQuant) و تصحیح
+  مرتبه‌دوم (GPTQ) پیاده نشده‌اند.
+* `.slmq` فقط خواندنی است — مدل ۲B را می‌شود **اجرا** کرد، نه روی این سخت‌افزار
+  از صفر **آموزش** داد.
 * GPU فقط با بکند libtorch.
 * ImGui خودش RTL نمی‌فهمد؛ متن فارسی از مسیر HarfBuzz رندر می‌شود، اما
   ویجت ورودی متن هنوز فارسی را شکل نمی‌دهد (پیش‌نمایش شکل‌دهی‌شده زیر آن نشان داده می‌شود).

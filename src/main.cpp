@@ -8,6 +8,8 @@
 //   slm chat                    interactive completion (terminal)
 //   slm eval                    hold-out loss / perplexity
 //   slm quantize                re-encode a checkpoint (f32/f16/q8)
+//   slm pack                    checkpoint -> memory mappable int4/int8 .slmq
+//   slm qrun / qbench / qeval   run, time and score a .slmq model
 //   slm bench                   forward+backward throughput
 //   slm live                    the full self-training system, terminal dashboard
 //   slm dashboard               the full self-training system, ImGui dashboard
@@ -36,6 +38,7 @@
 #include "core/text.h"
 #include "memory.h"
 #include "model.h"
+#include "qmodel.h"
 #include "tokenizer.h"
 
 using namespace slm;
@@ -171,6 +174,15 @@ void print_usage() {
       "  plan          --params 7e12 [--experts N --topk N --ctx N --ram 16 --vram 2]\n"
       "                memory / compute planner for very large configurations\n"
       "  quantize      --in F --out F [--dtype q8|f16|f32]\n"
+      "  pack          --in F.slm --out F.slmq [--bits 4|8] [--embed q8]\n"
+      "                --synth [--layers N --dim N --heads N --kv-heads N\n"
+      "                         --vocab N --ctx N]   build a big model directly\n"
+      "  qrun          --model F.slmq --tokenizer F [--prompt S] [--max-new N]\n"
+      "                mmap'd int4/int8 generation (no float weights)\n"
+      "  qbench        --model F.slmq [--prompt-len N] [--gen N]\n"
+      "                [--prefetch] [--cold]                  throughput + memory\n"
+      "  qeval         --model F.slmq --tokenizer F --data F [--ckpt F.slm]\n"
+      "                bits/char of the quantised model vs the f32 original\n"
       "  bench         [--config F] [--batch N] [--ctx N] [--iters N]\n"
       "  live          --ckpt F --tokenizer F --data F [--config F] [--seconds N]\n"
       "  dashboard     --ckpt F --tokenizer F --data F [--config F]\n"
@@ -181,16 +193,32 @@ void print_usage() {
 int cmd_info(const Args& a) {
   Config c;
   if (a.has("config")) c.load(a.str("config"));
+  // Shapes given only with --set describe a *new* model, so they must not be
+  // mistaken for a pre-upgrade config file (which would silently select the
+  // legacy LayerNorm/learned-position/GELU stack).
+  if (!a.has("config")) c.set("model.arch_version", "2");
   a.apply_sets(&c);
   GPTConfig g = GPTConfig::from_config(c);
   std::printf("backend            : %s\n", backend_name());
   std::printf("gpu                : %s\n", backend_on_gpu() ? "yes" : "no");
   std::printf("model              : %s\n", g.describe().c_str());
   const double p = static_cast<double>(g.param_count());
+  std::printf("parameters         : %lld  (%.3f M)\n",
+              static_cast<long long>(g.param_count()), p / 1e6);
+  std::printf("\nweights\n");
+  std::printf("  f32              : %s\n", human_bytes(p * 4).c_str());
+  std::printf("  f16              : %s\n", human_bytes(p * 2).c_str());
+  std::printf("  int8 (group 64)  : %s\n", human_bytes(p * 8.25 / 8.0).c_str());
+  std::printf("  int4 (group 64)  : %s\n", human_bytes(p * 4.25 / 8.0).c_str());
+  std::printf("\ndeployment (slm pack -> mmap'd .slmq, no float weights)\n");
+  std::printf("  int8 file        : %s\n",
+              human_bytes(static_cast<double>(
+                              qpack_estimate_bytes(g, QPackOptions{QType::Q8, QType::Q8, false, ""})))
+                  .c_str());
+  std::printf("  int4 file        : %s\n",
+              human_bytes(static_cast<double>(qpack_estimate_bytes(g, QPackOptions())))
+                  .c_str());
   std::printf("\nmemory budget (training, one replica)\n");
-  std::printf("  weights f32      : %s\n", human_bytes(p * 4).c_str());
-  std::printf("  weights f16      : %s\n", human_bytes(p * 2).c_str());
-  std::printf("  weights q8       : %s\n", human_bytes(p * 1.06).c_str());
   std::printf("  gradients f32    : %s\n", human_bytes(p * 4).c_str());
   std::printf("  AdamW state      : %s\n", human_bytes(p * 8).c_str());
   std::printf("  total (f32 train): %s\n", human_bytes(p * 16).c_str());
@@ -970,6 +998,365 @@ int cmd_quantize(const Args& a) {
   return 0;
 }
 
+// ========================================================= quantised (.slmq)
+// The deployment path.  `pack` turns a training checkpoint into a memory
+// mappable int4/int8 file; `qrun` / `qbench` / `qeval` run it with the integer
+// kernels and never materialise a float weight.
+
+void set_threads(const Args& a) {
+#ifdef _OPENMP
+  const int n = static_cast<int>(a.integer("threads", 0));
+  if (n > 0) omp_set_num_threads(n);
+#endif
+}
+
+bool parse_pack_options(const Args& a, QPackOptions* o) {
+  const std::string body = a.str("type", a.str("bits", "q4"));
+  if (!parse_qtype(body, &o->type)) {
+    std::fprintf(stderr, "pack: unknown --bits/--type '%s' (use 4, 8, f16, f32)\n",
+                 body.c_str());
+    return false;
+  }
+  const std::string emb = a.str("embed", o->type == QType::F32 ? "f32" : "q8");
+  if (!parse_qtype(emb, &o->embed_type)) {
+    std::fprintf(stderr, "pack: unknown --embed '%s'\n", emb.c_str());
+    return false;
+  }
+  o->progress = !a.flag("quiet");
+  if (a.has("note")) o->note = a.str("note");
+  return true;
+}
+
+void print_qmodel_report(const QModel& qm) {
+  const double P = static_cast<double>(qm.param_count());
+  std::printf("  %s\n", qm.describe().c_str());
+  std::printf("  parameters       : %lld  (%.3f M)\n",
+              static_cast<long long>(qm.param_count()), P / 1e6);
+  std::printf("  file             : %s  (%.3f bits/weight)\n",
+              human_bytes(static_cast<double>(qm.file_bytes())).c_str(),
+              qm.bits_per_weight());
+  std::printf("  same model f32   : %s   -> %.1fx smaller\n",
+              human_bytes(P * 4.0).c_str(),
+              P * 4.0 / std::max(1.0, static_cast<double>(qm.file_bytes())));
+  std::printf("  resident now     : %s  (page cache; a fresh process starts at 0)\n",
+              human_bytes(static_cast<double>(qm.resident_bytes())).c_str());
+}
+
+// ------------------------------------------------------------------ slm pack
+int cmd_pack(const Args& a) {
+  set_threads(a);
+  QPackOptions o;
+  if (!parse_pack_options(a, &o)) return 2;
+  const std::string out = a.str("out");
+  if (out.empty()) {
+    std::fprintf(stderr, "pack: --out is required\n");
+    return 2;
+  }
+  std::string err;
+  const double t0 = now_seconds();
+
+  if (a.flag("synth")) {
+    // No checkpoint: build a model of the requested shape directly in quantised
+    // form.  Rows are generated, quantised and written one chunk at a time, so
+    // packing a 2 B parameter file needs a few megabytes of RAM, not 8 GB.
+    Config c;
+    if (a.has("config")) c.load(a.str("config"));
+    if (!a.has("config")) c.set("model.arch_version", "2");
+    a.apply_sets(&c);
+    GPTConfig g = GPTConfig::from_config(c);
+    if (a.has("layers")) g.n_layer = a.integer("layers", g.n_layer);
+    if (a.has("dim")) g.n_embd = a.integer("dim", g.n_embd);
+    if (a.has("heads")) g.n_head = a.integer("heads", g.n_head);
+    if (a.has("kv-heads")) g.n_kv_head = a.integer("kv-heads", g.n_kv_head);
+    if (a.has("ffn")) g.ffn_hidden = a.integer("ffn", g.ffn_hidden);
+    if (a.has("vocab")) g.vocab_size = static_cast<int32_t>(a.integer("vocab", g.vocab_size));
+    if (a.has("ctx")) g.block_size = a.integer("ctx", g.block_size);
+    g.validate();
+    std::printf("synthesising %s\n", g.describe().c_str());
+    std::printf("  target file      : %s\n",
+                human_bytes(static_cast<double>(qpack_estimate_bytes(g, o))).c_str());
+    if (!qpack_synthesise(g, o, out, static_cast<uint64_t>(a.integer("seed", 1234)),
+                          &err)) {
+      std::fprintf(stderr, "pack: %s\n", err.c_str());
+      return 1;
+    }
+  } else {
+    const std::string in = a.str("in", a.str("ckpt"));
+    if (in.empty()) {
+      std::fprintf(stderr, "pack: --in <checkpoint.slm> (or --synth) is required\n");
+      return 2;
+    }
+    std::printf("packing %s -> %s  (body %s, embedding %s, group %lld)\n", in.c_str(),
+                out.c_str(), qtype_name(o.type), qtype_name(o.embed_type),
+                static_cast<long long>(kQBlock));
+    if (!qpack_from_checkpoint(in, o, out, &err)) {
+      std::fprintf(stderr, "pack: %s\n", err.c_str());
+      return 1;
+    }
+  }
+  const double dt = now_seconds() - t0;
+
+  QModel qm;
+  if (!qm.open(out, &err)) {
+    std::fprintf(stderr, "pack: wrote the file but cannot open it back: %s\n",
+                 err.c_str());
+    return 1;
+  }
+  std::printf("\nwrote %s in %.1f s\n", out.c_str(), dt);
+  print_qmodel_report(qm);
+  const std::string tokp = a.str("tokenizer");
+  if (!tokp.empty())
+    std::printf("\nrun it:  slm qrun --model %s --tokenizer %s --prompt \"...\"\n",
+                out.c_str(), tokp.c_str());
+  return 0;
+}
+
+// ------------------------------------------------------------------ slm qrun
+int cmd_qrun(const Args& a) {
+  set_threads(a);
+  QModel qm;
+  std::string err;
+  if (!qm.open(a.str("model"), &err)) {
+    std::fprintf(stderr, "qrun: %s\n", err.c_str());
+    return 1;
+  }
+  Tokenizer tok;
+  if (!tok.load(a.str("tokenizer"))) {
+    std::fprintf(stderr, "qrun: cannot load tokenizer %s\n", a.str("tokenizer").c_str());
+    return 1;
+  }
+  std::printf("%s\n", qm.describe().c_str());
+  std::printf("kernels: %s, %d thread(s)\n\n", quant_backend_name(), backend_threads());
+  if (a.flag("prefetch")) qm.prefetch();
+
+  GenOptions go;
+  go.max_new_tokens = static_cast<int>(a.integer("max-new", 96));
+  go.temperature = static_cast<float>(a.num("temp", 0.9));
+  go.top_k = static_cast<int>(a.integer("top-k", 40));
+  go.top_p = static_cast<float>(a.num("top-p", 0.95));
+  go.repetition_penalty = static_cast<float>(a.num("rep-penalty", 1.08));
+  go.seed = static_cast<uint64_t>(a.integer("seed", 0));
+
+  auto run = [&](const std::string& prompt) {
+    std::vector<int32_t> ids = tok.encode(prompt);
+    if (ids.empty()) ids.push_back(Tokenizer::kEot);
+    const double t0 = now_seconds();
+    int n = 0;
+    double first = 0.0;
+    qm.generate(ids, go, [&](const GenStep& s) {
+      if (n == 0) first = now_seconds() - t0;
+      std::printf("%s", tok.decode({s.token}).c_str());
+      std::fflush(stdout);
+      ++n;
+      return true;
+    });
+    const double dt = now_seconds() - t0;
+    std::printf(
+        "\n[%d tokens, %.1f tok/s decode, prompt of %zu tokens in %.2f s, "
+        "resident %s]\n",
+        n, (n - 1) / std::max(1e-6, dt - first), ids.size(), first,
+        human_bytes(static_cast<double>(qm.resident_bytes())).c_str());
+  };
+
+  if (a.has("prompt")) {
+    run(a.str("prompt"));
+    return 0;
+  }
+  std::printf("interactive mode - empty line quits\n");
+  std::string line;
+  while (true) {
+    std::printf("\n> ");
+    std::fflush(stdout);
+    if (!std::getline(std::cin, line) || line.empty()) break;
+    run(line);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------- slm qbench
+// Measures the two numbers that actually decide whether a model is usable:
+// prompt throughput (compute bound) and decode throughput (memory bound).
+int cmd_qbench(const Args& a) {
+  set_threads(a);
+  QModel qm;
+  std::string err;
+  if (!qm.open(a.str("model"), &err)) {
+    std::fprintf(stderr, "qbench: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("%s\n", qm.describe().c_str());
+  std::printf("kernels: %s, %d thread(s)\n", quant_backend_name(), backend_threads());
+  const int64_t plen = a.integer("prompt-len", 64);
+  const int64_t gen = a.integer("gen", 32);
+  const int64_t ctx = std::max<int64_t>(plen + gen + 1, 8);
+  if (a.flag("cold")) {
+    // Drop the file's clean pages so the run starts from disk, the way a fresh
+    // process on a fresh boot would.
+    qm.drop_page_cache();
+    std::printf("dropped page cache for the mapping\n");
+  }
+  if (a.flag("prefetch")) {
+    const double t0 = now_seconds();
+    qm.prefetch();
+    std::printf("prefetch (stream all pages): %.2f s\n", now_seconds() - t0);
+  }
+  std::printf("resident before: %s\n",
+              human_bytes(static_cast<double>(qm.resident_bytes())).c_str());
+
+  Rng rng(1234);
+  std::vector<int32_t> ids;
+  for (int64_t i = 0; i < plen; ++i)
+    ids.push_back(static_cast<int32_t>(rng.below(static_cast<uint64_t>(qm.config().vocab_size))));
+
+  QGenState st;
+  qm.reset(&st, ctx);
+  std::vector<float> logits;
+  const double t0 = now_seconds();
+  qm.forward(&st, ids, &logits);
+  const double t_prefill = now_seconds() - t0;
+
+  const double t1 = now_seconds();
+  for (int64_t i = 0; i < gen; ++i)
+    qm.forward_token(&st, static_cast<int32_t>(rng.below(static_cast<uint64_t>(
+                              qm.config().vocab_size))),
+                     &logits);
+  const double t_decode = now_seconds() - t1;
+
+  const double wbytes =
+      static_cast<double>(qm.param_count()) * qm.bits_per_weight() / 8.0;
+  std::printf("\nprompt (%lld tokens) : %.3f s  ->  %.0f tok/s\n",
+              static_cast<long long>(plen), t_prefill,
+              static_cast<double>(plen) / std::max(1e-9, t_prefill));
+  std::printf("decode (%lld tokens) : %.3f s  ->  %.1f tok/s  (%.1f ms/token)\n",
+              static_cast<long long>(gen), t_decode,
+              static_cast<double>(gen) / std::max(1e-9, t_decode),
+              1000.0 * t_decode / static_cast<double>(std::max<int64_t>(1, gen)));
+  // One decoded token reads every weight exactly once, so this is the honest
+  // memory-bandwidth number.  Note that a model small enough to sit in cache is
+  // *not* bandwidth bound and will show little difference between encodings; the
+  // win from int4 appears once the weights no longer fit (see docs).
+  std::printf("weight traffic      : %s per token  ->  %.1f GB/s effective\n",
+              human_bytes(wbytes).c_str(),
+              wbytes * static_cast<double>(gen) / std::max(1e-9, t_decode) / 1e9);
+  std::printf("KV cache (ctx %lld)  : %s\n", static_cast<long long>(ctx),
+              human_bytes(static_cast<double>(st.cache_bytes())).c_str());
+  std::printf("resident after      : %s of %s\n",
+              human_bytes(static_cast<double>(qm.resident_bytes())).c_str(),
+              human_bytes(static_cast<double>(qm.file_bytes())).c_str());
+  return 0;
+}
+
+// ----------------------------------------------------------------- slm qeval
+// Quality of the quantised model, and (with --ckpt) the exact cost of
+// quantisation measured on the same token stream.
+int cmd_qeval(const Args& a) {
+  set_threads(a);
+  QModel qm;
+  std::string err;
+  if (!qm.open(a.str("model"), &err)) {
+    std::fprintf(stderr, "qeval: %s\n", err.c_str());
+    return 1;
+  }
+  Tokenizer tok;
+  if (!tok.load(a.str("tokenizer"))) {
+    std::fprintf(stderr, "qeval: cannot load tokenizer %s\n", a.str("tokenizer").c_str());
+    return 1;
+  }
+  const std::string data = a.str("data");
+  std::ifstream f(data, std::ios::binary);
+  if (!f) {
+    std::fprintf(stderr, "qeval: cannot read %s\n", data.c_str());
+    return 1;
+  }
+  const int64_t max_bytes = a.integer("bytes", 200000);
+  std::string text;
+  text.resize(static_cast<size_t>(max_bytes));
+  f.read(&text[0], max_bytes);
+  text.resize(static_cast<size_t>(f.gcount()));
+  if (a.flag("tail")) {
+    // The hold-out slice used during training is the *end* of each file.
+    f.clear();
+    f.seekg(0, std::ios::end);
+    const int64_t total = static_cast<int64_t>(f.tellg());
+    if (total > max_bytes) {
+      f.seekg(total - max_bytes);
+      text.assign(static_cast<size_t>(max_bytes), '\0');
+      f.read(&text[0], max_bytes);
+      text.resize(static_cast<size_t>(f.gcount()));
+    }
+  }
+  // Do not cut a UTF-8 sequence in half; that would corrupt the first token.
+  text = utf8_sanitize(text);
+  const int64_t chars = static_cast<int64_t>(utf8_length(text));
+  std::vector<int32_t> ids = tok.encode(text);
+  const int64_t want = a.integer("tokens", 8000);
+  const double chars_per_token =
+      ids.empty() ? 1.0 : static_cast<double>(chars) / static_cast<double>(ids.size());
+  if (static_cast<int64_t>(ids.size()) > want) ids.resize(static_cast<size_t>(want));
+  if (ids.size() < 2) {
+    std::fprintf(stderr, "qeval: not enough text\n");
+    return 1;
+  }
+  const int64_t chunk = std::min<int64_t>(qm.config().block_size, 512);
+
+  std::printf("%s\n", qm.describe().c_str());
+  std::printf("data: %s  (%lld tokens, %.2f chars/token, chunks of %lld)\n\n",
+              data.c_str(), static_cast<long long>(ids.size()), chars_per_token,
+              static_cast<long long>(chunk));
+
+  // Note on speed: the quantised path scores one token at a time through the KV
+  // cache (exactly what generation does), while the f32 reference scores a whole
+  // window in one batched GEMM.  The two tok/s numbers are therefore *not*
+  // comparable - use `slm qbench` for throughput.
+  auto report = [&](const char* what, double nats, int64_t n, double secs) {
+    const double bpc = nats / (chars_per_token * std::log(2.0));
+    std::printf("  %-14s nats/token %7.4f   ppl %9.2f   bits/char %7.4f   "
+                "(%.1f s)\n",
+                what, nats, std::exp(nats), bpc, secs);
+    (void)n;
+    return bpc;
+  };
+
+  int64_t n = 0;
+  const double t0 = now_seconds();
+  const double nats_q = qm.eval_nats(ids, &n, chunk);
+  const double bpc_q = report(qtype_name(qm.body_type()), nats_q, n, now_seconds() - t0);
+
+  if (a.has("ckpt")) {
+    // Same tokens, same chunking, float32 weights: the difference is exactly the
+    // price of quantisation.
+    backend_init(static_cast<int>(a.integer("threads", 0)), false);
+    ParamStore ps;
+    CheckpointMeta meta;
+    if (!load_checkpoint(a.str("ckpt"), &ps, &meta)) {
+      std::fprintf(stderr, "qeval: cannot load %s\n", a.str("ckpt").c_str());
+      return 1;
+    }
+    GPTConfig g = GPTConfig::from_config(meta.extra);
+    g.n_layer = qm.config().n_layer;  // the checkpoint may have grown
+    GPT ref(g);
+    ref.load_params(ps);
+    const double t1 = now_seconds();
+    double total = 0.0;
+    int64_t nn = 0;
+    for (size_t start = 0; start + 1 < ids.size(); start += static_cast<size_t>(chunk)) {
+      const size_t stop = std::min(ids.size() - 1, start + static_cast<size_t>(chunk));
+      const int64_t T = static_cast<int64_t>(stop - start);
+      if (T < 1) break;
+      std::vector<int32_t> inp(ids.begin() + start, ids.begin() + start + T);
+      std::vector<int32_t> tgt(ids.begin() + start + 1, ids.begin() + start + T + 1);
+      total += ref.eval_loss(inp, tgt, 1, T) * static_cast<double>(T);
+      nn += T;
+    }
+    const double nats_f = nn ? total / static_cast<double>(nn) : 0.0;
+    const double bpc_f = report("f32 reference", nats_f, nn, now_seconds() - t1);
+    std::printf("\n  quantisation cost: %+.4f nats/token (%+.4f bits/char, %+.2f%% ppl)\n",
+                nats_q - nats_f, bpc_q - bpc_f,
+                100.0 * (std::exp(nats_q) / std::max(1e-9, std::exp(nats_f)) - 1.0));
+  }
+  return 0;
+}
+
 // -------------------------------------------------------------------- memory
 int cmd_memory(const Args& a) {
   MemoryStore mem;
@@ -1097,8 +1484,12 @@ int cmd_plan(const Args& a) {
   std::printf("\nweights\n");
   std::printf("  fp32             : %s\n", human(P * 4).c_str());
   std::printf("  fp16/bf16        : %s\n", human(P * 2).c_str());
-  std::printf("  int8 (group 64)  : %s\n", human(P * 1.0625).c_str());
-  std::printf("  int4 (group 64)  : %s\n", human(P * 0.5625).c_str());
+  // These are the exact figures of the .slmq format: group of 64 with one f16
+  // scale -> 8.25 and 4.25 bits per weight.
+  std::printf("  int8 (group 64)  : %s   (8.25 bits/weight, slm pack --bits 8)\n",
+              human(P * 8.25 / 8.0).c_str());
+  std::printf("  int4 (group 64)  : %s   (4.25 bits/weight, slm pack --bits 4)\n",
+              human(P * 4.25 / 8.0).c_str());
 
   const double grads = trainable * 2;          // bf16 grads
   const double adam = trainable * 8;           // fp32 m+v
@@ -1118,9 +1509,12 @@ int cmd_plan(const Args& a) {
   std::printf("  total            : %s .. %s\n", human(train_min).c_str(), human(train_max).c_str());
   std::printf("\ninference (batch %lld, ctx %lld)\n", static_cast<long long>(batch),
               static_cast<long long>(ctx));
-  std::printf("  weights int8     : %s\n", human(P * 1.0625).c_str());
+  std::printf("  weights int8     : %s\n", human(P * 8.25 / 8.0).c_str());
+  std::printf("  weights int4     : %s\n", human(P * 4.25 / 8.0).c_str());
   std::printf("  KV cache fp16    : %s\n", human(kv).c_str());
-  std::printf("  total int8       : %s\n", human(P * 1.0625 + kv).c_str());
+  std::printf("  total int8       : %s\n", human(P * 8.25 / 8.0 + kv).c_str());
+  std::printf("  total int4       : %s   <- what `slm qrun` actually maps\n",
+              human(P * 4.25 / 8.0 + kv).c_str());
 
   std::printf("\nverdict for your machine (--ram %.0f GiB, --vram %.0f GiB)\n", ram / 1073741824.0,
               vram / 1073741824.0);
@@ -1228,6 +1622,10 @@ int main(int argc, char** argv) {
     if (cmd == "eval") return cmd_eval(a);
     if (cmd == "langcheck") return cmd_langcheck(a);
     if (cmd == "quantize") return cmd_quantize(a);
+    if (cmd == "pack") return cmd_pack(a);
+    if (cmd == "qrun" || cmd == "qchat") return cmd_qrun(a);
+    if (cmd == "qbench") return cmd_qbench(a);
+    if (cmd == "qeval") return cmd_qeval(a);
     if (cmd == "bench") return cmd_bench(a);
     if (cmd == "plan") return cmd_plan(a);
     if (cmd == "tokenize") return cmd_tokenize(a);

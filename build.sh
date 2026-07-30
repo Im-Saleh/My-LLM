@@ -66,6 +66,8 @@ if [[ "$TESTS" == 1 ]]; then
   "$BUILD_DIR/slm_gradcheck"
   echo "==> text / tokenizer checks"
   "$BUILD_DIR/slm_texttest"
+  echo "==> quantised inference checks"
+  "$BUILD_DIR/slm_qtest"
 fi
 
 echo
@@ -88,4 +90,6 @@ next steps
                             --data data/sample_corpus.txt --config configs/slm-demo.conf
      (no display?)     $BUILD_DIR/slm live      --ckpt run/base.slm --tokenizer run/tok.slmtok \\
                             --data data/sample_corpus.txt --config configs/slm-demo.conf --autopilot
+  5) deploy int4       $BUILD_DIR/slm pack --in run/base.slm --out run/base-q4.slmq --bits 4
+                       $BUILD_DIR/slm qrun --model run/base-q4.slmq --tokenizer run/tok.slmtok --prompt "..."
 EOF

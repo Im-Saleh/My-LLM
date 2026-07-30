@@ -23,11 +23,13 @@ set(SLM_CORE_SOURCES
   src/core/dataset.cpp
   src/core/optim.cpp
   src/core/params.cpp
+  src/core/quant.cpp
   src/core/serialize.cpp
   src/core/tensor_common.cpp
   src/core/text.cpp
   src/memory.cpp
   src/model.cpp
+  src/qmodel.cpp
   src/tokenizer.cpp
 )
 if(SLM_WITH_LIBTORCH)
@@ -154,9 +156,12 @@ if(SLM_BUILD_TESTS)
   target_link_libraries(slm_gradcheck PRIVATE slm_core)
   add_executable(slm_texttest src/tests/text_test.cpp)
   target_link_libraries(slm_texttest PRIVATE slm_core)
+  add_executable(slm_qtest src/tests/quant_test.cpp)
+  target_link_libraries(slm_qtest PRIVATE slm_core)
   enable_testing()
   add_test(NAME gradcheck COMMAND slm_gradcheck)
   add_test(NAME text COMMAND slm_texttest)
+  add_test(NAME quant COMMAND slm_qtest)
 endif()
 
 # --------------------------------------------------------------------- install

@@ -31,6 +31,8 @@
 #include <thread>
 #include <vector>
 
+#include "qmodel.h"
+
 #include "gui_text.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -511,9 +513,15 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar);
     const CoordinatorStats cs = ctx.coord->stats();
-    ImGui::Text("%s   |   %.3fM parameters   |   backend %s   |   weights v%llu   |   "
-                "uptime %.0fs   |   tensors %.1f MiB",
-                ctx.mcfg->describe().c_str(), ctx.mcfg->param_count() / 1e6,
+    // The parameter count is read from the live config, so it visibly grows the
+    // moment progressive depth growth adds a block.  Next to it: the size this
+    // model would deploy at, in int4 - the number that decides whether it fits.
+    const double q4_mib =
+        static_cast<double>(qpack_estimate_bytes(*ctx.mcfg, QPackOptions())) /
+        (1024.0 * 1024.0);
+    ImGui::Text("%s   |   %.3fM parameters (int4 deploy %.1f MiB)   |   backend %s   |   "
+                "weights v%llu   |   uptime %.0fs   |   tensors %.1f MiB",
+                ctx.mcfg->describe().c_str(), ctx.mcfg->param_count() / 1e6, q4_mib,
                 backend_name(), static_cast<unsigned long long>(cs.weight_version),
                 Telemetry::now() - t0, backend_allocated_bytes() / (1024.0 * 1024.0));
     ImGui::SameLine(disp.x - 430);
