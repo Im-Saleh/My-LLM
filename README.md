@@ -26,6 +26,20 @@ sudo ./scripts/install_deps.sh          # کامپایلر، cmake، OpenGL/X11 
 ./scripts/quickstart.sh --config configs/slm-demo.conf --steps 500 --gui
 ```
 
+### مدل آماده (بدون آموزش)
+
+یک چک‌پوینت آموزش‌دیده‌ی fp16 در مخزن هست، پس بلافاصله بعد از بیلد قابل استفاده است:
+
+```bash
+build/slm chat      --ckpt models/demo-6m.slm --tokenizer models/demo-6m.slmtok
+build/slm dashboard --ckpt models/demo-6m.slm --tokenizer models/demo-6m.slmtok \
+                    --data data/sample_corpus.txt --config configs/slm-demo.conf
+#           (اول کورپوس را بساز: python3 scripts/make_sample_data.py data/sample_corpus.txt)
+```
+
+`models/demo-6m.slm` = ۶.۳۸M پارامتر، fp16 (۱۲.۲MB، خطای RMS نسبت به fp32 فقط ۰.۰۱۷٪،
+همان `loss 0.3524`).
+
 اگر ترجیح می‌دهی مرحله‌به‌مرحله:
 
 ```bash
@@ -93,7 +107,7 @@ LD_LIBRARY_PATH=/opt/libtorch/lib build/slm info
 | GEMM بومی | ۶۱ GFLOP/s تک‌هسته، ۱۸۰ GFLOP/s روی ۸ هسته (AVX2+FMA) |
 | آموزش (بومی) | ۴۵۱۸ tok/s برای ۱M پارامتر، ۸۳۸ tok/s برای ۱۱.۵M (batch 8، ctx 256) |
 | آموزش (libtorch CPU) | ۳۴۸۱ tok/s برای ۱۱.۵M — همان کانفیگ، ۴.۲ برابر سریع‌تر |
-| مدل دمو | ۶.۳۸M پارامتر، ۱۴۰۰ گام در ۱۶ دقیقه، holdout loss **۷.۱۰ → ۰.۳۳** (ppl 1.39) |
+| مدل دمو (`models/demo-6m.slm`) | ۶.۳۸M پارامتر، ۱۴۰۰ گام در ۱۶ دقیقه، holdout loss **۷.۱۰ → ۰.۳۳** (ppl 1.39) |
 | تولید با KV-cache | ۵۶–۷۵ tok/s روی CPU برای همین مدل |
 | کوانتیزاسیون | fp16 نصف، int8 گروهی ~۳.۹ برابر کوچک‌تر (با گزارش خطای RMS) |
 | checkpointing | حافظه‌ی فعال‌سازی از ۴۳۲MiB به ۹۰MiB (batch 8، ctx 256، dim 384) |

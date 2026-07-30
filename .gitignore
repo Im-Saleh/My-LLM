@@ -10,6 +10,8 @@ runs/
 *.slm
 *.slmtok
 *.jsonl
+!models/*.slm
+!models/*.slmtok
 data/*.txt
 !data/.gitkeep
 
