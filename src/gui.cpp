@@ -1154,7 +1154,8 @@ void chat_view(DashboardContext& ctx, AgentUi& ui) {
   if (!shaping_ready()) {
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kWarn);
     ImGui::TextWrapped(
-        "No Arabic-capable font found, so Persian will render as '???'. Install "
+        "No Arabic-capable font found, so Persian will render as boxes or "
+        "question marks. Install "
         "one and restart:  Debian/Ubuntu: fonts-noto-core  |  Fedora: "
         "google-noto-sans-arabic-fonts  |  Arch: noto-fonts");
     ImGui::PopStyleColor();

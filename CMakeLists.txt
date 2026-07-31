@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.16)
-project(slm VERSION 0.3.0 LANGUAGES CXX)
+project(slm VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,9 @@ option(SLM_WITH_LIBTORCH "Use libtorch (PyTorch C++) as the tensor backend"     
 option(SLM_NATIVE_ARCH   "Optimise for the build machine (-march=native)"       OFF)
 option(SLM_BUILD_TESTS   "Build the gradient checking test binary"              ON)
 option(SLM_GLFW_WAYLAND  "Build the bundled GLFW with Wayland support"          OFF)
+option(SLM_WITH_LLAMA    "Build the GGUF backend (llama.cpp) for the OLMo model"  OFF)
+option(SLM_WITH_CURL     "Use libcurl for the web tools (else the curl binary)"   ON)
+set(SLM_LLAMA_DIR "" CACHE PATH "Existing llama.cpp checkout (empty = download)")
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fno-math-errno -DNDEBUG")
 
@@ -100,8 +103,22 @@ if(SLM_WITH_LLAMA)
   set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_SERVER  OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_TOOLS   OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_COMMON  OFF CACHE BOOL "" FORCE)
   set(LLAMA_CURL          OFF CACHE BOOL "" FORCE)
   set(GGML_NATIVE         ON  CACHE BOOL "" FORCE)
+  # llama.cpp defaults to SHARED libraries on Linux: it produces libllama.so,
+  # libggml.so, libggml-base.so and libggml-cpu.so inside the build tree, and the
+  # executable gets a RUNPATH pointing there.  `cmake --install` strips that
+  # RUNPATH and does not install those four files, so the installed binary dies
+  # with "libllama.so: cannot open shared object file".  Linking them statically
+  # makes the installed binary self-contained, which is what a distributed
+  # package needs.  Override with -DSLM_LLAMA_SHARED=ON if you really want .so
+  # files (the install rules below then ship them and set an RPATH).
+  option(SLM_LLAMA_SHARED "Link llama.cpp as shared libraries" OFF)
+  if(NOT SLM_LLAMA_SHARED)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(GGML_STATIC ON CACHE BOOL "" FORCE)
+  endif()
   if(SLM_LLAMA_DIR AND EXISTS "${SLM_LLAMA_DIR}/include/llama.h")
     message(STATUS "llama.cpp: using ${SLM_LLAMA_DIR}")
     add_subdirectory("${SLM_LLAMA_DIR}" "${CMAKE_BINARY_DIR}/llama-build" EXCLUDE_FROM_ALL)
@@ -205,6 +222,7 @@ endif()
 
 add_executable(slm src/main.cpp)
 target_link_libraries(slm PRIVATE slm_live)
+target_compile_definitions(slm PRIVATE SLM_VERSION="${PROJECT_VERSION}")
 
 if(SLM_BUILD_TESTS)
   add_executable(slm_gradcheck src/tests/gradcheck.cpp)
@@ -230,7 +248,22 @@ endif()
 
 # --------------------------------------------------------------------- install
 include(GNUInstallDirs)
+
+# So an installed binary can still find co-installed libraries if anything is
+# linked shared (llama.cpp with SLM_LLAMA_SHARED, or a system libtorch).
+set(CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR};${CMAKE_INSTALL_FULL_LIBDIR}")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set_target_properties(slm PROPERTIES INSTALL_RPATH "${CMAKE_INSTALL_RPATH}")
 install(TARGETS slm RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(SLM_WITH_LLAMA AND BUILD_SHARED_LIBS)
+  # A shared llama.cpp build: its four libraries have to travel with the binary.
+  foreach(_lib llama ggml ggml-base ggml-cpu)
+    if(TARGET ${_lib})
+      install(TARGETS ${_lib} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+              RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+  endforeach()
+endif()
 install(DIRECTORY configs/ DESTINATION ${CMAKE_INSTALL_DATADIR}/slm/configs)
 install(FILES scripts/make_sample_data.py scripts/make_math_data.py scripts/fetch_data.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/slm/scripts

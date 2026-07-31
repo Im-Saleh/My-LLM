@@ -22,6 +22,17 @@ namespace {
 // model's sampling far better than JSON or a heading.
 constexpr const char* kAnswerMarker = "ANSWER:";
 
+// A synthesiser must score at least this fraction of the winner's score to be
+// allowed to rewrite it.  0.75 is loose enough that a slightly-behind strong
+// model still aggregates (which is the Mixture-of-Agents behaviour we want) and
+// tight enough to exclude a model that is simply not in the same class.
+constexpr double kSynthesisFloor = 0.75;
+
+// A peer answer below this fraction of the round's best is hidden from the
+// critique prompt rather than shown: criticising noise wastes the round and
+// contaminates the reader's context with it.
+constexpr double kPeerFloor = 0.55;
+
 std::string trim(const std::string& s) {
   size_t b = 0, e = s.size();
   while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
@@ -656,11 +667,31 @@ DebateTranscript DebateEngine::run(const std::string& question,
       if (cancel && cancel->load()) break;
       // The peers this actor should react to: the strongest answers that are not
       // its own, capped so the prompt stays inside a small context window.
+      // Peer answers are filtered by quality, not just taken in rank order.
+      // Showing a much weaker participant's answer to a much stronger one is not
+      // neutral: the strong model spends its output criticising noise and, worse,
+      // absorbs the noise as context.  (Observed directly: SPT-30M's degenerate
+      // drafts leaking invented numbers into OLMo's answer.)  A peer has to be
+      // within kPeerFloor of the best answer in the round to be worth reading.
+      double best_score = 0.0;
+      for (const DebateAnswer& x : prev.answers) best_score = std::max(best_score, x.score);
       std::vector<const DebateAnswer*> peers;
+      int dropped = 0;
       for (const DebateAnswer& x : prev.answers) {
         if (x.participant == a.spec.name) continue;
+        if (best_score > 0.0 && x.score < kPeerFloor * best_score) {
+          ++dropped;
+          continue;
+        }
         peers.push_back(&x);
         if (peers.size() >= 3) break;
+      }
+      if (dropped) {
+        char pn[140];
+        std::snprintf(pn, sizeof(pn),
+                      "round %d: hid %d peer answer(s) from %s as too weak to be "
+                      "worth criticising\n", r, dropped, a.spec.name.c_str());
+        tr.decision_log += pn;
       }
       std::string own;
       for (const DebateAnswer& x : prev.answers)
@@ -772,6 +803,23 @@ DebateTranscript DebateEngine::run(const std::string& question,
       if (!a.spec.can_synthesise) continue;
       if (!agg || a.spec.cost_rank > agg->spec.cost_rank) agg = &a;
     }
+    // Same guard on the normal path: the aggregator has to be at least roughly as
+    // good as the answer it is about to rewrite.
+    if (agg && winner) {
+      double agg_best = -1.0;
+      for (const DebateAnswer& x : last.answers)
+        if (x.participant == agg->spec.name) agg_best = std::max(agg_best, x.score);
+      if (agg_best >= 0.0 && agg_best < kSynthesisFloor * winner->score &&
+          agg->spec.name != winner->participant) {
+        char n3[220];
+        std::snprintf(n3, sizeof(n3),
+                      "%s would synthesise but scored %.3f against the winner's "
+                      "%.3f; keeping the winning answer verbatim\n",
+                      agg->spec.name.c_str(), agg_best, winner->score);
+        tr.decision_log += n3;
+        agg = nullptr;
+      }
+    }
     const double margin = cluster_margin(mass);
     const bool skip_expensive =
         cfg.cascade && agg && agg->spec.cost_rank > 0.5f && margin >= cfg.escalate_margin;
@@ -781,11 +829,34 @@ DebateTranscript DebateEngine::run(const std::string& question,
                     "synthesis skipped the expensive model: margin %.2f >= %.2f\n",
                     margin, static_cast<double>(cfg.escalate_margin));
       tr.decision_log += note;
+      // Fall back to a cheaper aggregator ONLY if it is itself competitive.
+      // Handing the final word to a model that scored far below the winner does
+      // not save cost, it destroys the answer: the free alternative is the
+      // winning answer verbatim, and that is strictly better than a rewrite by
+      // something weaker.  (Observed with SPT-30M rewriting OLMo's answer into
+      // noise, which is what this guard exists to prevent.)
+      Actor* cheap = nullptr;
       for (Actor& a : actors)
         if (a.spec.can_synthesise && a.spec.cost_rank <= 0.5f) {
-          agg = &a;
+          cheap = &a;
           break;
         }
+      const double win = winner ? winner->score : 0.0;
+      double cheap_best = -1.0;
+      if (cheap)
+        for (const DebateAnswer& x : last.answers)
+          if (x.participant == cheap->spec.name) cheap_best = std::max(cheap_best, x.score);
+      if (cheap && cheap_best >= kSynthesisFloor * win) {
+        agg = cheap;
+      } else {
+        char n2[220];
+        std::snprintf(n2, sizeof(n2),
+                      "no competitive cheap synthesiser (best %.3f vs winner %.3f); "
+                      "keeping the winning answer verbatim\n",
+                      cheap_best, win);
+        tr.decision_log += n2;
+        agg = nullptr;
+      }
     }
     if (agg) {
       std::string ask = ctx_block + "Question: " + question + "\n\nCandidate answers:\n";

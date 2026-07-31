@@ -27,6 +27,10 @@ git clone https://github.com/Im-Saleh/My-LLM && cd My-LLM
 slm                                  # همین. داشبورد باز می‌شود.
 ```
 
+> **اگر قبلاً نصب کرده‌اید و خطای `libllama.so: cannot open shared object file`
+> گرفتید**: باگ لینک بود و اصلاح شد. یک بار با پوشه‌ی build تازه نصب کنید:
+> `rm -rf build && ./update.sh`  (توضیح کامل: [`docs/TRAINING.fa.md`](docs/TRAINING.fa.md) بخش ۸)
+
 `install.sh` وابستگی‌ها را نصب می‌کند، با GUI و llama.cpp بیلد می‌گیرد، باینری و
 **مدل SPT** را در `/usr/local` می‌گذارد، یک لانچر دسکتاپ می‌سازد، و با `--with-olmo`
 مدل آماده‌ی **OLMo 3 7B** را هم دانلود می‌کند. بدون root:
@@ -436,6 +440,8 @@ slm up          <- شروع اینجا: پیدا/ساخت مدل + داشبور�
 slm             (بدون آرگومان) داشبورد را باز می‌کند
 slm agent       --ask S [--mode fast|strong|debate|self] [--index D]
 slm fetch-model olmo | list                       دانلود مدل آماده
+slm --version                                    نسخه + بکندهای فعال
+./update.sh                                       به‌روزرسانی نصب موجود
 slm_gradcheck / slm_texttest / slm_qtest / slm_agenttest
 slm_codebasetest / slm_debatetest                        ۳۷۰ بررسی
 ```

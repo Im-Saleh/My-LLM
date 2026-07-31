@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <cerrno>
 
+#include "agent/http.h"
 #include "agent/runtime.h"
 #include "spt_assets.h"
 #include "telemetry.h"
@@ -2103,6 +2104,13 @@ int main(int argc, char** argv) {
     }
     if (cmd == "-h" || cmd == "--help" || cmd == "help") {
       print_usage();
+      return 0;
+    }
+    if (cmd == "--version" || cmd == "-V" || cmd == "version") {
+      std::printf("slm %s  |  tensor backend %s  |  gguf %s  |  web %s\n",
+                  SLM_VERSION, backend_name(),
+                  ModelBackendGGUF::compiled_in() ? "llama.cpp" : "not built",
+                  HttpClient::backend_name());
       return 0;
     }
     std::fprintf(stderr, "unknown command '%s'\n\n", cmd.c_str());

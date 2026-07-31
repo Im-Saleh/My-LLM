@@ -159,3 +159,59 @@ slm tokenize --tokenizer models/spt.slmtok --in "math=data/math.txt" --out-dir d
 
 int4 در برابر مرجع f32 روی همان توکن‌ها: **+۰.۳۵٪ perplexity**، ۶.۷ برابر کوچک‌تر،
 ۴۴۸ tok/s رمزگشایی روی ۸ هسته، ۱۸.۴۵ MiB حافظه‌ی resident.
+
+
+---
+
+## ۸) نصب: باگ `libllama.so` و اصلاحش
+
+اولین نصب واقعی با این خطا شکست:
+
+```
+/usr/local/bin/slm: error while loading shared libraries: libllama.so:
+cannot open shared object file: No such file or directory
+```
+
+**علت:** llama.cpp روی لینوکس به‌طور پیش‌فرض کتابخانه‌ی **shared** می‌سازد — چهار فایل
+`libllama.so`، `libggml.so`، `libggml-base.so`، `libggml-cpu.so` — که فقط داخل
+پوشه‌ی build وجود دارند. باینری یک `RUNPATH` به همان پوشه می‌گیرد، و
+`cmake --install` آن RUNPATH را حذف می‌کند و آن چهار فایل را هم نصب نمی‌کند. پس
+باینری نصب‌شده لینکرش را پیدا نمی‌کند.
+
+```
+$ readelf -d build/slm | grep RUNPATH
+ Library runpath: [/projects/build/lm/bin:]     ← پوشه‌ی build، که بعد از install حذف می‌شود
+```
+
+**اصلاح:** llama.cpp استاتیک لینک می‌شود (`BUILD_SHARED_LIBS=OFF` + `GGML_STATIC=ON`)،
+پس باینری نصب‌شده خودکفا است:
+
+```
+$ ldd /usr/local/bin/slm | grep -c "llama\|ggml"
+0
+```
+
+سه محافظ دیگر هم اضافه شد:
+
+* `CMAKE_INSTALL_RPATH` روی `$ORIGIN/../lib` — اگر کسی با `-DSLM_LLAMA_SHARED=ON`
+  عمداً shared بسازد، کتابخانه‌ها نصب و پیدا می‌شوند.
+* `install.sh` قبل از استفاده از باینری، **اجرایش را تست می‌کند** (`slm --version`) و
+  اگر خطای لینکر بود، دقیقاً همین توضیح و راه‌حل را چاپ می‌کند. قبلاً خطا *بعد از*
+  «SPT installed» ظاهر می‌شد و شبیه مشکل مدل به نظر می‌رسید.
+* اگر پوشه‌ی build قدیمی `BUILD_SHARED_LIBS:BOOL=ON` در cache داشته باشد،
+  `install.sh` آن را دور می‌ریزد — وگرنه cache قدیمی اصلاح را بی‌اثر می‌کند.
+
+و دانلود OLMo دیگر به باینری وابسته نیست: `install.sh --with-olmo` خودش با `curl`
+دانلود می‌کند (با `-C -` برای ادامه‌دادن و بررسی magic فایل GGUF)، چون یک باینری
+معیوب نباید جلوی رسیدن مدل را بگیرد.
+
+### به‌روزرسانی
+
+```bash
+./update.sh                 # pull + rebuild + reinstall، بدون دست‌زدن به داده‌ها
+./update.sh --keep-model    # مدلی که خودت آموزش دادی را حفظ کن
+./update.sh --with-olmo     # اگر OLMo نبود، بگیرش
+```
+
+`update.sh` پرفیکس نصب فعلی را از `which slm` پیدا می‌کند، تغییرات محلی را stash
+می‌کند، نسخه‌ی قبل و بعد را نشان می‌دهد، و OLMo را هرگز دوباره دانلود نمی‌کند.
