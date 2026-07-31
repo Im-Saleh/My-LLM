@@ -279,6 +279,8 @@ int run_self_training(const AppOptions& opt) {
 
   Telemetry tel;
   tel.open_audit(opt_ref.workdir + "/audit.jsonl");
+  // Off unless asked for, either in the config or with --train.
+  tel.set_self_training_enabled(opt_ref.cfg.get_bool("train.enabled", false));
   tel.log("info", "app", "session start",
           {{"backend", backend_name()},
            {"model", mcfg.describe()},
@@ -358,7 +360,9 @@ int run_self_training(const AppOptions& opt) {
     ao.workspace = opt_ref.workspace;
     ao.workdir = opt_ref.workdir;
     ao.index_cache = opt_ref.workdir + "/codebase.idx";
-    ao.gguf = opt_ref.gguf;
+    ao.gguf = opt_ref.gguf.empty() ? find_gguf() : opt_ref.gguf;
+    if (!ao.gguf.empty() && opt_ref.gguf.empty())
+      std::printf("  ready-made model: %s\n", ao.gguf.c_str());
     ao.gguf_ctx = static_cast<int>(c.get_int("gguf.ctx", 4096));
     ao.gguf_threads = static_cast<int>(c.get_int("gguf.threads", 0));
     ao.gguf_gpu_layers = static_cast<int>(c.get_int("gguf.gpu_layers", 0));

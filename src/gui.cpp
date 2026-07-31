@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -56,6 +57,12 @@ const ImU32 kColors[kNumStreams] = {
 };
 
 ShapedText g_shaper;
+
+}  // namespace
+
+bool shaping_ready() { return g_shaper.ready(); }
+
+namespace {
 
 // Draws one line of text, using the Persian shaper when the string contains
 // Arabic script.  Falls back to plain ImGui text otherwise (and when the
@@ -855,6 +862,565 @@ void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
       "the continual thread");
 }
 
+// ============================================================== visual design
+// A dark theme with one accent colour, generous padding and rounded surfaces.
+// The old layout was six fixed windows fighting over 1600x950; this is a single
+// window with a sidebar and one view at a time, which is what makes room for the
+// chat to be the main thing rather than a 34%-wide column.
+namespace theme {
+
+constexpr ImVec4 kBg = ImVec4(0.055f, 0.063f, 0.082f, 1.00f);
+constexpr ImVec4 kSurface = ImVec4(0.086f, 0.098f, 0.125f, 1.00f);
+constexpr ImVec4 kSurface2 = ImVec4(0.118f, 0.133f, 0.165f, 1.00f);
+constexpr ImVec4 kBorder = ImVec4(0.180f, 0.200f, 0.243f, 1.00f);
+constexpr ImVec4 kText = ImVec4(0.878f, 0.898f, 0.925f, 1.00f);
+constexpr ImVec4 kTextDim = ImVec4(0.514f, 0.553f, 0.616f, 1.00f);
+constexpr ImVec4 kAccent = ImVec4(0.365f, 0.522f, 0.988f, 1.00f);
+constexpr ImVec4 kAccentDim = ImVec4(0.365f, 0.522f, 0.988f, 0.24f);
+constexpr ImVec4 kGood = ImVec4(0.290f, 0.800f, 0.510f, 1.00f);
+constexpr ImVec4 kWarn = ImVec4(0.980f, 0.741f, 0.286f, 1.00f);
+constexpr ImVec4 kBad = ImVec4(0.937f, 0.376f, 0.376f, 1.00f);
+constexpr ImVec4 kUser = ImVec4(0.475f, 0.702f, 0.996f, 1.00f);
+constexpr ImVec4 kModel = ImVec4(0.427f, 0.867f, 0.706f, 1.00f);
+
+void apply() {
+  ImGuiStyle& s = ImGui::GetStyle();
+  s.WindowRounding = 0.0f;
+  s.ChildRounding = 10.0f;
+  s.FrameRounding = 8.0f;
+  s.PopupRounding = 10.0f;
+  s.ScrollbarRounding = 10.0f;
+  s.GrabRounding = 8.0f;
+  s.TabRounding = 8.0f;
+  s.WindowPadding = ImVec2(18, 16);
+  s.FramePadding = ImVec2(12, 7);
+  s.ItemSpacing = ImVec2(10, 9);
+  s.ItemInnerSpacing = ImVec2(8, 6);
+  s.ScrollbarSize = 11.0f;
+  s.GrabMinSize = 11.0f;
+  s.WindowBorderSize = 0.0f;
+  s.ChildBorderSize = 1.0f;
+  s.FrameBorderSize = 0.0f;
+  s.SeparatorTextBorderSize = 1.0f;
+  s.SeparatorTextPadding = ImVec2(18, 6);
+  s.WindowTitleAlign = ImVec2(0.0f, 0.5f);
+
+  ImVec4* c = s.Colors;
+  c[ImGuiCol_WindowBg] = kBg;
+  c[ImGuiCol_ChildBg] = kSurface;
+  c[ImGuiCol_PopupBg] = kSurface2;
+  c[ImGuiCol_Border] = kBorder;
+  c[ImGuiCol_Text] = kText;
+  c[ImGuiCol_TextDisabled] = kTextDim;
+  c[ImGuiCol_FrameBg] = kSurface2;
+  c[ImGuiCol_FrameBgHovered] = ImVec4(0.157f, 0.176f, 0.216f, 1.0f);
+  c[ImGuiCol_FrameBgActive] = ImVec4(0.196f, 0.220f, 0.271f, 1.0f);
+  c[ImGuiCol_TitleBg] = kSurface;
+  c[ImGuiCol_TitleBgActive] = kSurface;
+  c[ImGuiCol_MenuBarBg] = kSurface;
+  c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+  c[ImGuiCol_ScrollbarGrab] = ImVec4(0.243f, 0.271f, 0.325f, 1.0f);
+  c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.310f, 0.345f, 0.408f, 1.0f);
+  c[ImGuiCol_CheckMark] = kAccent;
+  c[ImGuiCol_SliderGrab] = kAccent;
+  c[ImGuiCol_SliderGrabActive] = ImVec4(0.478f, 0.616f, 1.0f, 1.0f);
+  c[ImGuiCol_Button] = kSurface2;
+  c[ImGuiCol_ButtonHovered] = ImVec4(0.196f, 0.227f, 0.290f, 1.0f);
+  c[ImGuiCol_ButtonActive] = ImVec4(0.243f, 0.282f, 0.361f, 1.0f);
+  c[ImGuiCol_Header] = kAccentDim;
+  c[ImGuiCol_HeaderHovered] = ImVec4(0.365f, 0.522f, 0.988f, 0.38f);
+  c[ImGuiCol_HeaderActive] = ImVec4(0.365f, 0.522f, 0.988f, 0.52f);
+  c[ImGuiCol_Separator] = kBorder;
+  c[ImGuiCol_SeparatorHovered] = kAccent;
+  c[ImGuiCol_Tab] = kSurface2;
+  c[ImGuiCol_TabHovered] = kAccentDim;
+  c[ImGuiCol_TabSelected] = ImVec4(0.365f, 0.522f, 0.988f, 0.42f);
+  c[ImGuiCol_PlotLines] = kAccent;
+  c[ImGuiCol_PlotHistogram] = kAccent;
+  c[ImGuiCol_TableHeaderBg] = kSurface2;
+  c[ImGuiCol_TableBorderLight] = kBorder;
+  c[ImGuiCol_TableBorderStrong] = kBorder;
+  c[ImGuiCol_ModalWindowDimBg] = ImVec4(0.02f, 0.02f, 0.03f, 0.72f);
+}
+
+// A rounded status pill.  Used everywhere a boolean or a short value has to be
+// legible at a glance rather than read.
+void pill(const char* text, const ImVec4& col, bool filled = false) {
+  const ImVec2 sz = ImGui::CalcTextSize(text);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const float h = sz.y + 8.0f, w = sz.x + 18.0f;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImU32 bg = ImGui::ColorConvertFloat4ToU32(
+      filled ? col : ImVec4(col.x, col.y, col.z, 0.16f));
+  dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), bg, h * 0.5f);
+  if (!filled)
+    dl->AddRect(p, ImVec2(p.x + w, p.y + h),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(col.x, col.y, col.z, 0.45f)),
+                h * 0.5f);
+  dl->AddText(ImVec2(p.x + 9.0f, p.y + 4.0f),
+              ImGui::ColorConvertFloat4ToU32(filled ? ImVec4(0.05f, 0.06f, 0.08f, 1.0f)
+                                                   : col),
+              text);
+  ImGui::Dummy(ImVec2(w, h));
+}
+
+void heading(const char* text) {
+  ImGui::PushStyleColor(ImGuiCol_Text, kText);
+  ImGui::TextUnformatted(text);
+  ImGui::PopStyleColor();
+  ImGui::Spacing();
+}
+
+void muted(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+  ImGui::TextV(fmt, ap);
+  ImGui::PopStyleColor();
+  va_end(ap);
+}
+
+// A card: a titled child window with padding.  Returns false when collapsed
+// (never, currently) so call sites read like a scope.
+bool begin_card(const char* id, const ImVec2& size, const char* title = nullptr) {
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, kSurface);
+  ImGui::BeginChild(id, size, ImGuiChildFlags_Border);
+  ImGui::PopStyleColor();
+  if (title) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
+    ImGui::TextUnformatted(title);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+  }
+  return true;
+}
+void end_card() { ImGui::EndChild(); }
+
+}  // namespace theme
+
+// ================================================================= navigation
+enum class View { kChat = 0, kDebate, kModels, kCodebase, kTraining, kMemory, kLogs };
+
+struct NavItem {
+  View view;
+  const char* label;
+  const char* hint;
+};
+const NavItem kNav[] = {
+    {View::kChat, "Chat", "ask, with web + codebase + shell"},
+    {View::kDebate, "Debate", "both models argue, then synthesise"},
+    {View::kModels, "Models", "SPT and OLMo: load, size, speed"},
+    {View::kCodebase, "Codebase", "index a folder and search it"},
+    {View::kTraining, "Training", "self-training (off by default)"},
+    {View::kMemory, "Memory", "long term memory"},
+    {View::kLogs, "Logs", "audit trail"},
+};
+
+// One compact status card per backend, shown in the sidebar.
+void sidebar_model_card(DashboardContext& ctx, const BackendPtr& b) {
+  const BackendStatus s = b->status();
+  ImGui::PushID(b->id().c_str());
+  theme::begin_card((b->id() + "_card").c_str(), ImVec2(-1, 74));
+  ImGui::PushStyleColor(ImGuiCol_Text, s.loaded ? theme::kModel : theme::kTextDim);
+  ImGui::TextUnformatted(b->display_name().c_str());
+  ImGui::PopStyleColor();
+  if (s.loaded) {
+    theme::muted("%.1fM  %s", s.params / 1e6,
+                 human_bytes(static_cast<double>(s.weight_bytes)).c_str());
+    if (s.last_decode_tps > 0.0)
+      theme::muted("%.0f tok/s", s.last_decode_tps);
+    else
+      theme::muted("ready");
+  } else {
+    theme::muted("not loaded");
+    if (ImGui::SmallButton("load")) {
+      std::string err;
+      if (!b->load(&err) && ctx.tel)
+        ctx.tel->log("warn", "agent", "load failed: " + err);
+    }
+  }
+  theme::end_card();
+  ImGui::PopID();
+}
+
+void sidebar(DashboardContext& ctx, View* view, double uptime) {
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::kSurface);
+  ImGui::BeginChild("sidebar", ImVec2(228, -1), ImGuiChildFlags_None);
+  ImGui::PopStyleColor();
+
+  ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+  ImGui::SetWindowFontScale(1.25f);
+  ImGui::TextUnformatted("SPT");
+  ImGui::SetWindowFontScale(1.0f);
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  theme::muted("self-improving");
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  for (const NavItem& n : kNav) {
+    const bool sel = (*view == n.view);
+    if (sel) {
+      ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccentDim);
+      ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+      ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
+    }
+    if (ImGui::Button(n.label, ImVec2(-1, 36))) *view = n.view;
+    ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", n.hint);
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  if (ctx.agent)
+    for (const BackendPtr& b : ctx.agent->backends().all()) sidebar_model_card(ctx, b);
+
+  // Bottom block: the global stop and the session facts.
+  const float bottom = 132.0f;
+  ImGui::Dummy(ImVec2(1, std::max(0.0f, ImGui::GetContentRegionAvail().y - bottom)));
+  const bool stopped = ctx.tel->stopped();
+  ImGui::PushStyleColor(ImGuiCol_Button,
+                        stopped ? ImVec4(0.15f, 0.45f, 0.22f, 1.0f)
+                                : ImVec4(0.62f, 0.14f, 0.14f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                        stopped ? ImVec4(0.20f, 0.55f, 0.28f, 1.0f)
+                                : ImVec4(0.80f, 0.18f, 0.18f, 1.0f));
+  if (ImGui::Button(stopped ? "RESUME TRAINING" : "EMERGENCY STOP", ImVec2(-1, 40))) {
+    if (stopped) ctx.tel->clear_emergency_stop();
+    else ctx.tel->emergency_stop();
+  }
+  ImGui::PopStyleColor(2);
+  theme::muted("%.0f M params  |  up %.0fs", ctx.mcfg->param_count() / 1e6, uptime);
+  theme::muted("%s", backend_name());
+  if (ImGui::Button("quit", ImVec2(-1, 28))) ctx.quit->store(true);
+  ImGui::EndChild();
+}
+
+// ==================================================================== chat view
+// The main event.  Everything the agent can do is reachable from here: the model
+// dropdown chooses SPT, OLMo or a debate, and the two toggles decide whether a
+// question may reach the web and the indexed codebase.
+void chat_view(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.actrl || !ctx.actrl->attached()) {
+    ImGui::TextColored(theme::kBad, "the agent runtime is not available");
+    theme::muted("check the audit log for why the model failed to load");
+    return;
+  }
+  const AgentSnapshot snap = ctx.actrl->snapshot();
+
+  // ---- header: model + capabilities
+  theme::begin_card("chathdr", ImVec2(-1, 56));
+  ImGui::AlignTextToFramePadding();
+  theme::muted("model");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(210);
+  ImGui::Combo("##mode", &ui.mode, kModeNames, 4);
+  const AskMode m = mode_of(ui.mode);
+  if ((m == AskMode::kStrong || m == AskMode::kDebate) && ctx.agent &&
+      !ctx.agent->mode_available(m)) {
+    ImGui::SameLine();
+    theme::pill("OLMo not installed", theme::kWarn);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("run:  slm fetch-model olmo");
+  }
+  if (m == AskMode::kDebate) {
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("SPT x", &ui.fast_mult, 1, 5);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("OLMo x", &ui.strong_mult, 1, 5);
+  } else if (m == AskMode::kSelfDebate) {
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::SliderInt("voices", &ui.voices, 2, 4);
+  }
+  ImGui::SameLine(0, 20);
+  ImGui::Checkbox("web + shell", &ui.use_tools);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "lets the answer use web_search, web_fetch, read_file, list_dir and "
+        "shell.  Anything risky still asks you first.");
+  ImGui::SameLine();
+  ImGui::Checkbox("codebase", &ui.use_codebase);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("retrieves from the indexed folder before answering");
+  theme::end_card();
+
+  if (!shaping_ready()) {
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kWarn);
+    ImGui::TextWrapped(
+        "No Arabic-capable font found, so Persian will render as '???'. Install "
+        "one and restart:  Debian/Ubuntu: fonts-noto-core  |  Fedora: "
+        "google-noto-sans-arabic-fonts  |  Arch: noto-fonts");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+  }
+
+  // ---- transcript
+  const float input_h = 86.0f;
+  theme::begin_card("chatbody", ImVec2(-1, -input_h));
+  for (size_t i = 0; i < snap.history.size(); ++i) {
+    const AgentTurn& t = snap.history[i];
+    ImGui::PushID(static_cast<int>(i));
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kUser);
+    ImGui::TextUnformatted("you");
+    ImGui::PopStyleColor();
+    ui_wrapped(t.question);
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kModel);
+    ImGui::TextUnformatted(t.was_debate ? "debate" : (t.mode == AskMode::kStrong ? "OLMo" : "SPT"));
+    ImGui::PopStyleColor();
+    if (!t.tools.empty()) {
+      for (const ToolTrace& tt : t.tools) {
+        const ImVec4 col = tt.denied ? theme::kWarn : (tt.ok ? theme::kTextDim : theme::kBad);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::Text("  %s %s  (%.2fs)%s", tt.tool.c_str(),
+                    utf8_truncate(tt.args, 60).c_str(), tt.seconds,
+                    tt.denied ? "  denied" : (tt.ok ? "" : "  failed"));
+        ImGui::PopStyleColor();
+      }
+    }
+    ui_wrapped(t.answer.empty() ? ("(" + t.error + ")") : t.answer);
+    theme::muted("%.2fs  |  %d prompt (%d cached)  |  %d generated", t.seconds,
+                 t.prompt_tokens, t.reused_tokens, t.gen_tokens);
+    // Ratings feed the feedback (DPO) thread, exactly as the old chat did.
+    ImGui::SameLine();
+    if (ctx.chat) {
+      for (int sc = 1; sc <= 5; ++sc) {
+        char b[8];
+        std::snprintf(b, sizeof(b), "%d", sc);
+        if (ImGui::SmallButton(b)) {
+          RatedSample rs;
+          rs.prompt = t.question;
+          rs.response = t.answer;
+          rs.score = static_cast<float>(sc);
+          rs.t = Telemetry::now();
+          ctx.hub->push_rating(rs);
+          ctx.tel->log("info", "feedback", "rated an agent answer",
+                       {{"score", std::to_string(sc)}});
+        }
+        if (sc < 5) ImGui::SameLine();
+      }
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PopID();
+  }
+  if (snap.busy) {
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kUser);
+    ImGui::TextUnformatted("you");
+    ImGui::PopStyleColor();
+    ui_wrapped(snap.question);
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kWarn);
+    ImGui::TextUnformatted(snap.progress > 0.0 ? "debating..." : "thinking...");
+    ImGui::PopStyleColor();
+    if (snap.progress > 0.0) {
+      ImGui::ProgressBar(static_cast<float>(snap.progress), ImVec2(-1, 6), "");
+      if (!snap.live.rounds.empty()) {
+        const DebateRound& r = snap.live.rounds.back();
+        theme::muted("round %d (%s), %zu answers", r.index, r.kind.c_str(),
+                     r.answers.size());
+      }
+    }
+    if (!snap.partial.empty()) {
+      const ImVec4 amber = theme::kWarn;
+      ui_wrapped(snap.partial, &amber);
+    }
+  }
+  if (snap.history.empty() && !snap.busy) {
+    const ImVec4 dim = theme::kTextDim;
+    theme::muted("Ask anything - Persian, English or Python.");
+    ImGui::Spacing();
+    ui_wrapped("۲۳۴ ضربدر ۵۶ چند است؟", &dim);
+    ui_wrapped("این پروژه چه کاری انجام می‌دهد؟", &dim);
+    theme::muted("        (needs an indexed folder)");
+    theme::muted("latest release of CMake?");
+    theme::muted("        (needs web enabled)");
+  }
+  if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
+  theme::end_card();
+
+  // ---- input
+  ImGui::Spacing();
+  const bool busy = snap.busy;
+  ImGui::SetNextItemWidth(-190);
+  const bool enter = ImGui::InputTextWithHint(
+      "##ask", "ask SPT anything...", ui.input, sizeof(ui.input),
+      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  bool send = false;
+  if (busy) {
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+    if (ImGui::Button("stop", ImVec2(84, 0))) ctx.actrl->cancel();
+    ImGui::PopStyleColor();
+  } else {
+    ImGui::PushStyleColor(ImGuiCol_Button, theme::kAccent);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.05f, 0.06f, 0.08f, 1.0f));
+    send = ImGui::Button("send", ImVec2(84, 0));
+    ImGui::PopStyleColor(2);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("clear", ImVec2(76, 0))) ctx.actrl->clear_history();
+  if ((enter || send) && ui.input[0] != '\0' && !busy) {
+    ctx.actrl->ask(ui.input, m, ui.fast_mult, ui.strong_mult, ui.voices, ui.use_tools,
+                   ui.use_codebase, ui.max_tokens);
+    ui.input[0] = '\0';
+  }
+  if (ui.input[0] != '\0' && needs_shaping(ui.input)) {
+    theme::muted("preview:");
+    ImGui::SameLine();
+    ui_line(ui.input);
+  }
+}
+
+// ================================================================ models view
+void models_view(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.agent) {
+    ImGui::TextColored(theme::kBad, "the agent runtime is not available");
+    return;
+  }
+  theme::heading("Models");
+  theme::muted(
+      "SPT is your model: it trains, it can be taught, and it is the one the "
+      "self-training threads improve.  OLMo is the ready-made model: no training, "
+      "much stronger, much slower.");
+  ImGui::Spacing();
+
+  for (const BackendPtr& b : ctx.agent->backends().all()) {
+    const BackendStatus s = b->status();
+    ImGui::PushID(b->id().c_str());
+    theme::begin_card((b->id() + "_big").c_str(), ImVec2(-1, 168));
+    ImGui::SetWindowFontScale(1.15f);
+    ImGui::PushStyleColor(ImGuiCol_Text, s.loaded ? theme::kModel : theme::kTextDim);
+    ImGui::TextUnformatted(b->display_name().c_str());
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::SameLine();
+    theme::pill(s.loaded ? "loaded" : "not loaded",
+                s.loaded ? theme::kGood : theme::kTextDim, s.loaded);
+    ImGui::SameLine();
+    theme::pill(b->runtime().c_str(), theme::kAccent);
+    if (b->caps().trainable) {
+      ImGui::SameLine();
+      theme::pill("trainable", theme::kWarn);
+    }
+    ImGui::Spacing();
+    if (s.loaded) {
+      ImGui::Text("%s", s.detail.c_str());
+      theme::muted("%lld parameters  |  %s weights  |  %s KV cache",
+                   static_cast<long long>(s.params),
+                   human_bytes(static_cast<double>(s.weight_bytes)).c_str(),
+                   human_bytes(static_cast<double>(s.kv_bytes)).c_str());
+      theme::muted("%lld calls  |  %.0f tok/s decode  |  %.0f tok/s prompt  |  "
+                   "%lld tokens served from cache",
+                   static_cast<long long>(s.calls), s.last_decode_tps,
+                   s.last_prompt_tps, static_cast<long long>(s.cache_hit_tokens));
+      if (!b->caps().trainable && ImGui::Button("unload", ImVec2(120, 0))) b->unload();
+    } else {
+      if (!s.error.empty()) ImGui::TextColored(theme::kBad, "%s", s.error.c_str());
+      else theme::muted("%s", s.detail.c_str());
+      ImGui::Spacing();
+      if (ImGui::Button("load now", ImVec2(140, 0))) {
+        std::string err;
+        if (!b->load(&err))
+          ctx.tel->log("warn", "agent", "load failed: " + err);
+      }
+      if (b->id() == "olmo") {
+        ImGui::SameLine();
+        theme::muted("or from a terminal:  slm fetch-model olmo");
+      }
+    }
+    theme::end_card();
+    ImGui::PopID();
+    ImGui::Spacing();
+  }
+
+  theme::begin_card("membudget", ImVec2(-1, 108), "memory");
+  const size_t w = ctx.agent->backends().weight_bytes();
+  const size_t kv = ctx.agent->backends().kv_bytes();
+  ImGui::Text("weights %s   +   KV cache %s",
+              human_bytes(static_cast<double>(w)).c_str(),
+              human_bytes(static_cast<double>(kv)).c_str());
+  if (!ctx.agent->codebase().empty()) {
+    const IndexStats st = ctx.agent->codebase().stats();
+    ImGui::Text("codebase index %s  (%lld chunks)",
+                human_bytes(static_cast<double>(st.memory_bytes)).c_str(),
+                static_cast<long long>(st.chunks));
+  }
+  theme::muted("GGUF weights are memory mapped, so the pages are shared and "
+               "evictable rather than counted twice.");
+  theme::end_card();
+  ImGui::Spacing();
+  ImGui::SetNextItemWidth(220);
+  ImGui::SliderInt("answer length (tokens)", &ui.max_tokens, 64, 1024);
+}
+
+// =============================================================== training view
+// Self-training is OFF by default; this is where it is turned on, and the switch
+// says plainly what it will do.
+void training_view(DashboardContext& ctx, AgentUi& ui, bool* visible, bool* log_scale,
+                   float* window_seconds, int* layer, int* head) {
+  theme::heading("Self-training");
+  const bool on = ctx.tel->self_training_enabled();
+  theme::begin_card("swcard", ImVec2(-1, 96));
+  bool sw = on;
+  if (ImGui::Checkbox("  let the model keep training itself", &sw))
+    ctx.tel->set_self_training_enabled(sw);
+  theme::muted(
+      "Off by default.  When on, three threads learn from your chats, from their "
+      "own filtered output and from your 1-5 ratings, and a coordinator validates "
+      "every change on a hold-out set before it is published - a change that makes "
+      "quality worse is rolled back automatically.");
+  ImGui::SameLine();
+  theme::pill(on ? "running" : "paused", on ? theme::kGood : theme::kTextDim, on);
+  theme::end_card();
+  ImGui::Spacing();
+
+  if (ImGui::BeginTabBar("traintabs")) {
+    if (ImGui::BeginTabItem("dataset")) {
+      dataset_panel(ctx, ui);
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("loss")) {
+      for (int i = 0; i < kNumStreams; ++i) {
+        legend(stream_name(static_cast<Stream>(i)), kColors[i], &visible[i]);
+        if (i + 1 < kNumStreams) ImGui::SameLine();
+      }
+      ImGui::SetNextItemWidth(180);
+      ImGui::SliderFloat("window (s)", window_seconds, 20.0f, 1800.0f, "%.0f");
+      ImGui::SameLine();
+      ImGui::Checkbox("log10", log_scale);
+      plot_losses(*ctx.tel, ImGui::GetContentRegionAvail().y - 8.0f, *window_seconds,
+                  *log_scale, visible);
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("threads")) {
+      for (int i = 0; i < kNumSources; ++i) trainer_panel(ctx, static_cast<Source>(i));
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("coordinator")) {
+      coordinator_panel(ctx);
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("attention")) {
+      attention_panel(*ctx.tel, *ctx.mcfg, layer, head);
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("next token")) {
+      token_panel(*ctx.tel);
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+  }
+}
+
 }  // namespace
 
 bool gui_available() { return true; }
@@ -883,9 +1449,7 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   ImGuiIO& io = ImGui::GetIO();
   io.IniFilename = nullptr;
   ImGui::StyleColorsDark();
-  ImGuiStyle& style = ImGui::GetStyle();
-  style.WindowRounding = 6.0f;
-  style.FrameRounding = 4.0f;
+  theme::apply();
   ImGui_ImplGlfw_InitForOpenGL(win, true);
   ImGui_ImplOpenGL3_Init("#version 150");
 
@@ -897,7 +1461,7 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                            "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf"}) {
     if (!std::filesystem::exists(path)) continue;
-    if (io.Fonts->AddFontFromFileTTF(path, 17.0f)) break;
+    if (io.Fonts->AddFontFromFileTTF(path, 18.5f)) break;
   }
 
   // The shaper needs a live GL context, so it is initialised here.
@@ -920,9 +1484,9 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   bool log_scale = false;
   float window_seconds = 180.0f;
   int layer = 0, head = 0;
-  char input[1024] = {0};
   char mem_input[512] = {0};
   AgentUi aui;
+  View view = View::kChat;
   const double t0 = Telemetry::now();
 
   while (!glfwWindowShouldClose(win) && !ctx.quit->load()) {
@@ -931,140 +1495,71 @@ int run_imgui_dashboard(DashboardContext& ctx) {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
     const ImVec2 disp = io.DisplaySize;
-    const float col_w = disp.x * 0.34f;
 
-    // ------------------------------------------------------------- header
+    // One full-screen window: a sidebar plus whichever view is selected.  Six
+    // competing fixed windows is what made the old dashboard feel cramped.
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(disp.x, 62), ImGuiCond_Always);
-    ImGui::Begin("header", nullptr,
+    ImGui::SetNextWindowSize(disp, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 14));
+    ImGui::Begin("##shell", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar);
-    const CoordinatorStats cs = ctx.coord->stats();
-    // The parameter count is read from the live config, so it visibly grows the
-    // moment progressive depth growth adds a block.  Next to it: the size this
-    // model would deploy at, in int4 - the number that decides whether it fits.
-    const double q4_mib =
-        static_cast<double>(qpack_estimate_bytes(*ctx.mcfg, QPackOptions())) /
-        (1024.0 * 1024.0);
-    ImGui::Text("%s   |   %.3fM parameters (int4 deploy %.1f MiB)   |   backend %s   |   "
-                "weights v%llu   |   uptime %.0fs   |   tensors %.1f MiB",
-                ctx.mcfg->describe().c_str(), ctx.mcfg->param_count() / 1e6, q4_mib,
-                backend_name(), static_cast<unsigned long long>(cs.weight_version),
-                Telemetry::now() - t0, backend_allocated_bytes() / (1024.0 * 1024.0));
-    if (ctx.actrl && ctx.actrl->attached()) {
-      const AgentSnapshot as = ctx.actrl->snapshot();
-      ImGui::SameLine();
-      if (as.busy)
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "|  agent %.0f%%",
-                           100.0 * as.progress);
-      else if (as.pending_approvals)
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "|  %zu approvals waiting",
-                           as.pending_approvals);
-    }
-    ImGui::SameLine(disp.x - 430);
-    if (ctx.tel->stopped()) {
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.2f, 1.0f));
-      if (ImGui::Button("RESUME TRAINING", ImVec2(200, 34))) ctx.tel->clear_emergency_stop();
-      ImGui::PopStyleColor();
-    } else {
-      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.10f, 0.10f, 1.0f));
-      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.90f, 0.15f, 0.15f, 1.0f));
-      if (ImGui::Button("EMERGENCY STOP", ImVec2(200, 34))) ctx.tel->emergency_stop();
-      ImGui::PopStyleColor(2);
-    }
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus);
+    sidebar(ctx, &view, Telemetry::now() - t0);
     ImGui::SameLine();
-    if (ImGui::Button("restore best", ImVec2(120, 34))) ctx.coord->restore_best();
-    ImGui::SameLine();
-    if (ImGui::Button("quit", ImVec2(70, 34))) ctx.quit->store(true);
-    ImGui::End();
 
-    // ---------------------------------------------------------- loss chart
-    ImGui::SetNextWindowPos(ImVec2(0, 62), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(disp.x - 2 * col_w, 330), ImGuiCond_Always);
-    ImGui::Begin("training loss", nullptr, ImGuiWindowFlags_NoMove);
-    for (int i = 0; i < kNumStreams; ++i) {
-      legend(stream_name(static_cast<Stream>(i)), kColors[i], &visible[i]);
-      if (i + 1 < kNumStreams) ImGui::SameLine();
-    }
-    ImGui::SetNextItemWidth(200);
-    ImGui::SliderFloat("window (s)", &window_seconds, 20.0f, 1800.0f, "%.0f");
-    ImGui::SameLine();
-    ImGui::Checkbox("log10", &log_scale);
-    plot_losses(*ctx.tel, ImGui::GetContentRegionAvail().y - 8.0f, window_seconds, log_scale,
-                visible);
-    ImGui::End();
-
-    // ------------------------------------- attention / agent / codebase / data
-    // One tabbed window instead of four: on a 1600x950 screen there is only room
-    // for one of these at a time, and tabs keep the layout stable.
-    ImGui::SetNextWindowPos(ImVec2(0, 392), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(disp.x - 2 * col_w, disp.y - 392), ImGuiCond_Always);
-    ImGui::Begin("inspect", nullptr, ImGuiWindowFlags_NoMove);
-    if (ImGui::BeginTabBar("inspecttabs")) {
-      if (ImGui::BeginTabItem("agent")) {
-        model_selector(ctx, aui);
-        ImGui::Separator();
+    ImGui::BeginChild("main", ImVec2(-1, -1), ImGuiChildFlags_None);
+    switch (view) {
+      case View::kChat:
+        chat_view(ctx, aui);
+        break;
+      case View::kDebate:
         debate_panel(ctx, aui);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("attention")) {
-        attention_panel(*ctx.tel, *ctx.mcfg, &layer, &head);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("codebase")) {
+        break;
+      case View::kModels:
+        models_view(ctx, aui);
+        break;
+      case View::kCodebase:
         codebase_panel(ctx, aui);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("dataset / train")) {
-        dataset_panel(ctx, aui);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("tools")) {
-        tools_panel(ctx);
-        ImGui::EndTabItem();
-      }
-      ImGui::EndTabBar();
+        break;
+      case View::kTraining:
+        training_view(ctx, aui, visible, &log_scale, &window_seconds, &layer, &head);
+        break;
+      case View::kMemory:
+        theme::heading("Long term memory");
+        theme::muted(
+            "What you write here is injected into the prompt; \"teach the weights\" "
+            "also queues it for the continual thread so it outlives the context "
+            "window.");
+        ImGui::Spacing();
+        memory_panel(ctx, mem_input, sizeof(mem_input));
+        break;
+      case View::kLogs:
+        theme::heading("Audit log");
+        theme::muted("every self-training decision and every tool call, also "
+                     "appended to %s/audit.jsonl",
+                     ctx.opt ? ctx.opt->workdir.c_str() : "runs");
+        ImGui::Spacing();
+        theme::begin_card("logbody", ImVec2(-1, -1));
+        for (const std::string& l : ctx.tel->recent_logs(300)) {
+          ImVec4 col = theme::kTextDim;
+          if (l.find(" accept ") != std::string::npos) col = theme::kGood;
+          else if (l.find(" reject ") != std::string::npos) col = theme::kBad;
+          else if (l.find(" warn ") != std::string::npos) col = theme::kWarn;
+          else if (l.find(" error ") != std::string::npos) col = theme::kBad;
+          else if (l.find(" tool ") != std::string::npos) col = theme::kAccent;
+          else if (l.find(" agent ") != std::string::npos) col = theme::kModel;
+          ui_wrapped(l, &col);
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f)
+          ImGui::SetScrollHereY(1.0f);
+        theme::end_card();
+        break;
     }
+    ImGui::EndChild();
     ImGui::End();
+    ImGui::PopStyleVar();
     approval_modal(ctx);
-
-    // -------------------------------------------------- self-training panel
-    ImGui::SetNextWindowPos(ImVec2(disp.x - 2 * col_w, 62), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(col_w, disp.y - 62), ImGuiCond_Always);
-    ImGui::Begin("self-training", nullptr, ImGuiWindowFlags_NoMove);
-    for (int i = 0; i < kNumSources; ++i) trainer_panel(ctx, static_cast<Source>(i));
-    ImGui::TextColored(ImVec4(0.7f, 0.95f, 0.75f, 1.0f), "coordinator");
-    coordinator_panel(ctx);
-    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.9f, 1.0f), "next token distribution");
-    token_panel(*ctx.tel);
-    ImGui::Separator();
-    ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.6f, 1.0f), "long term memory");
-    memory_panel(ctx, mem_input, sizeof(mem_input));
-    ImGui::End();
-
-    // ----------------------------------------------------- chat + audit log
-    ImGui::SetNextWindowPos(ImVec2(disp.x - col_w, 62), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(col_w, (disp.y - 62) * 0.55f), ImGuiCond_Always);
-    ImGui::Begin("chat", nullptr, ImGuiWindowFlags_NoMove);
-    chat_panel(ctx, input, sizeof(input));
-    ImGui::End();
-
-    ImGui::SetNextWindowPos(ImVec2(disp.x - col_w, 62 + (disp.y - 62) * 0.55f),
-                            ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(col_w, (disp.y - 62) * 0.45f), ImGuiCond_Always);
-    ImGui::Begin("audit log", nullptr, ImGuiWindowFlags_NoMove);
-    for (const std::string& l : ctx.tel->recent_logs(120)) {
-      ImVec4 col(0.75f, 0.75f, 0.8f, 1.0f);
-      if (l.find(" accept ") != std::string::npos) col = ImVec4(0.5f, 0.95f, 0.6f, 1.0f);
-      else if (l.find(" reject ") != std::string::npos) col = ImVec4(1.0f, 0.6f, 0.5f, 1.0f);
-      else if (l.find(" warn ") != std::string::npos) col = ImVec4(1.0f, 0.85f, 0.4f, 1.0f);
-      else if (l.find(" error ") != std::string::npos) col = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-      else if (l.find(" augment ") != std::string::npos) col = ImVec4(0.6f, 0.85f, 1.0f, 1.0f);
-      ui_wrapped(l, &col);
-    }
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
-    ImGui::End();
 
     ImGui::Render();
     int w = 0, h = 0;

@@ -23,9 +23,37 @@
 
 ```bash
 git clone https://github.com/Im-Saleh/My-LLM && cd My-LLM
-./build.sh                 # بیلد
-./build/slm up             # همین. مدل را خودش پیدا می‌کند و داشبورد باز می‌شود.
+./install.sh --deps --with-olmo      # نصب کامل: هر دو مدل + لانچر دسکتاپ
+slm                                  # همین. داشبورد باز می‌شود.
 ```
+
+`install.sh` وابستگی‌ها را نصب می‌کند، با GUI و llama.cpp بیلد می‌گیرد، باینری و
+**مدل SPT** را در `/usr/local` می‌گذارد، یک لانچر دسکتاپ می‌سازد، و با `--with-olmo`
+مدل آماده‌ی **OLMo 3 7B** را هم دانلود می‌کند. بدون root:
+`./install.sh --prefix ~/.local`. بدون OLMo هم کار می‌کند و بعداً
+`slm fetch-model olmo` اضافه‌اش می‌کند.
+
+### دو مدل
+
+| | SPT | OLMo |
+|---|---|---|
+| چیست | **مدل شما** — ۳۲.۴M پارامتر | **مدل آماده** — OLMo 3 7B Instruct |
+| حجم | ۱۸ MB (int4) | ۴.۵ GB (Q4_K_M) |
+| سرعت | ۴۴۸ tok/s | چند tok/s روی CPU |
+| آموزش | آموزش‌دیده + قابل ادامه + خودآموز | بدون آموزش |
+| نصب | همراه پروژه | `slm fetch-model olmo` |
+
+در بخش **Chat** از منوی بالا انتخاب می‌کنید: `fast (SPT)`، `strong (OLMo)`،
+`debate (both)` یا `self-debate`. همه‌ی امکانات agent در همان chat فعال است:
+جست‌وجوی وب، خواندن صفحه، خواندن پوشه/کدبیس، و shell با تأیید شما.
+
+![the dashboard](docs/img/gui_chat.png)
+
+### خودآموزی به‌طور پیش‌فرض خاموش است
+
+سه thread خودآموزی تا وقتی در تب **Training** سوئیچ را روشن نکنید کار نمی‌کنند
+(یا `--set train.enabled=true`). مدلی که به‌محض باز شدن داشبورد وزن‌های خودش را
+بازنویسی کند، چیزی نیست که کسی از یک بسته‌ی نصبی انتظار دارد.
 
 `slm up` هیچ آرگومانی لازم ندارد: مدل `spt` را در `./models`، `~/.local/share/slm`،
 `/usr/share/slm/models` و کنار خود باینری می‌گردد، و اگر پیدا نکرد **خودش یک مدل
@@ -180,6 +208,7 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 | [`docs/MULTILINGUAL.fa.md`](docs/MULTILINGUAL.fa.md) | **استراتژی توکنایزر، ترکیب دیتاست با درصد، پلن آموزش مرحله‌ای، ارزیابی** + منابع فارسی/کد |
 | [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | توضیح فنی دقیق coordinator و ترکیب سه منبع آپدیت |
 | [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | نمای کلی معماری، نمودار، همزمانی، بودجه‌ی حافظه |
+| [`docs/TRAINING.fa.md`](docs/TRAINING.fa.md) | **گزارش آموزش SPT-30M**: داده، اعداد، و آنچه یاد نگرفت |
 | [`docs/AGENT.fa.md`](docs/AGENT.fa.md) | **عامل دو-مدلی، مناظره‌ی وزن‌دار، ابزارها و RAG کدبیس** |
 | [`docs/QUANTIZATION.fa.md`](docs/QUANTIZATION.fa.md) | **int4/int8 + mmap: اجرای مدل ۲ میلیارد پارامتری** روی همین سخت‌افزار |
 | [`docs/SCALING.fa.md`](docs/SCALING.fa.md) | **۷ تریلیون پارامتر: اعداد واقعی** و نردبان اندازه‌های عملی |
@@ -404,7 +433,9 @@ slm qeval       --model F.slmq --data F [--ckpt F.slm]   کیفیت کوانتی
 slm bench       [--config F] [--batch N]                 توان عبوری
 slm live        / slm dashboard                          سیستم کامل + داشبورد
 slm up          <- شروع اینجا: پیدا/ساخت مدل + داشبورد، بدون آرگومان
-slm agent       --ask S [--mode fast|strong|debate|self] [--gguf F] [--index D]
+slm             (بدون آرگومان) داشبورد را باز می‌کند
+slm agent       --ask S [--mode fast|strong|debate|self] [--index D]
+slm fetch-model olmo | list                       دانلود مدل آماده
 slm_gradcheck / slm_texttest / slm_qtest / slm_agenttest
 slm_codebasetest / slm_debatetest                        ۳۷۰ بررسی
 ```

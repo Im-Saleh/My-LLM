@@ -155,6 +155,14 @@ class Telemetry {
   void set_chat_busy(bool b) { chat_busy_.store(b); }
   bool chat_busy() const { return chat_busy_.load(); }
 
+  // Master switch for the three self-training threads.  Off by default: a model
+  // that starts rewriting its own weights the moment the dashboard opens is not
+  // what someone installing a package expects, and it makes every measurement
+  // taken afterwards irreproducible.  The threads stay alive and idle so the
+  // switch takes effect within a fraction of a second.
+  void set_self_training_enabled(bool on) { self_train_.store(on); }
+  bool self_training_enabled() const { return self_train_.load(); }
+
  private:
   size_t capacity_;
   mutable std::mutex loss_m_;
@@ -179,6 +187,7 @@ class Telemetry {
 
   std::atomic<bool> estop_{false};
   std::atomic<bool> chat_busy_{false};
+  std::atomic<bool> self_train_{false};
 };
 
 }  // namespace slm

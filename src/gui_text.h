@@ -65,4 +65,8 @@ class ShapedText {
 // True when the string contains Arabic-script letters (so it needs shaping).
 bool needs_shaping(const std::string& utf8);
 
+// True when a font with Arabic coverage was found and the shaper is live.  The
+// GUI uses this to explain a missing font instead of drawing '???'.
+bool shaping_ready();
+
 }  // namespace slm

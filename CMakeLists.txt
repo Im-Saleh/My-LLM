@@ -232,7 +232,7 @@ endif()
 include(GNUInstallDirs)
 install(TARGETS slm RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY configs/ DESTINATION ${CMAKE_INSTALL_DATADIR}/slm/configs)
-install(FILES scripts/make_sample_data.py scripts/fetch_data.sh
+install(FILES scripts/make_sample_data.py scripts/make_math_data.py scripts/fetch_data.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/slm/scripts
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
                     WORLD_READ WORLD_EXECUTE)

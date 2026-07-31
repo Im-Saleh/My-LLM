@@ -167,6 +167,11 @@ void TrainerBase::loop() {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       continue;
     }
+    if (tel_ && !tel_->self_training_enabled()) {
+      set_status("paused (self-training is off)");
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
     if (tel_ && !tel_->trainer_enabled(src_)) {
       set_status("disabled");
       std::this_thread::sleep_for(std::chrono::milliseconds(200));

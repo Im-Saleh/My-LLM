@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "spt_assets.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -240,6 +241,43 @@ bool bootstrap_spt(const std::string& dir, const std::string& corpus_path,
       "starter model created (untrained). Open the training panel, point it at a "
       "dataset, and press train - or run: slm pretrain --data <file>";
   return true;
+}
+
+std::string find_gguf(const std::string& prefer) {
+  std::vector<std::string> dirs = spt_search_dirs();
+  const std::string ud = spt_user_dir();
+  dirs.insert(dirs.begin(), ud + "/models");
+  dirs.push_back(ud);
+  const std::string home = env("HOME");
+  if (!home.empty()) {
+    dirs.push_back(home + "/models");
+    dirs.push_back(home + "/.cache/slm/models");
+  }
+  dirs.push_back("/usr/share/slm/models");
+  std::string best;
+  int64_t best_rank = -1;
+  for (const std::string& d : dirs) {
+    std::error_code ec;
+    if (!fs::is_directory(d, ec)) continue;
+    for (const fs::directory_entry& e : fs::directory_iterator(d, ec)) {
+      if (ec) break;
+      if (!e.is_regular_file(ec)) continue;
+      const std::string p = e.path().string();
+      if (p.size() < 6 || p.compare(p.size() - 5, 5, ".gguf") != 0) continue;
+      const int64_t sz = static_cast<int64_t>(fs::file_size(p, ec));
+      if (ec || sz < 1000000) continue;  // a stub or a failed download
+      std::string low = p;
+      for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      // Preference beats size: a 3 GB OLMo is wanted over a 7 GB something else.
+      const int64_t rank =
+          (low.find(prefer) != std::string::npos ? (int64_t)1 << 50 : 0) + sz;
+      if (rank > best_rank) {
+        best_rank = rank;
+        best = p;
+      }
+    }
+  }
+  return best;
 }
 
 const char* spt_seed_corpus() {

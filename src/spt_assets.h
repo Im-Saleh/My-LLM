@@ -57,6 +57,11 @@ bool bootstrap_spt(const std::string& dir, const std::string& corpus_path,
                    SptAssets* out, std::string* err,
                    const std::function<void(const std::string&)>& log = nullptr);
 
+// Finds a downloaded GGUF (the ready-made model).  Prefers a filename that
+// mentions olmo, then the largest file, so a directory with several quants picks
+// the best one rather than an arbitrary one.  Empty when there is none.
+std::string find_gguf(const std::string& prefer = "olmo");
+
 // The built-in multilingual seed corpus (Persian + English + Python).  Small on
 // purpose: it exists to make a tokenizer and a runnable model, not to teach.
 const char* spt_seed_corpus();

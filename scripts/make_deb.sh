@@ -53,9 +53,20 @@ install -m 0755 "$ROOT"/scripts/make_sample_data.py "$STAGE/usr/share/$PKG/scrip
 install -m 0755 "$ROOT"/scripts/fetch_data.sh "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/fetch_data.py "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/make_trilingual_data.py "$STAGE/usr/share/$PKG/scripts/"
+install -m 0755 "$ROOT"/scripts/make_math_data.py "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/update_data.sh "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/train_stages.sh "$STAGE/usr/share/$PKG/scripts/"
 install -m 0755 "$ROOT"/scripts/quickstart.sh "$STAGE/usr/share/$PKG/scripts/"
+# The models: without them the package installs a program with nothing to run.
+install -d "$STAGE/usr/share/$PKG/models"
+for m in spt.slmtok spt.slm spt-q4.slmq; do
+  [[ -f "$ROOT/models/$m" ]] && install -m 0644 "$ROOT/models/$m" "$STAGE/usr/share/$PKG/models/$m"
+done
+# Desktop launcher, so the dashboard is also one double click.
+install -d "$STAGE/usr/share/applications"
+sed 's|@CMAKE_INSTALL_FULL_BINDIR@|/usr/bin|' "$ROOT/packaging/slm.desktop.in" \
+  > "$STAGE/usr/share/applications/slm.desktop"
+chmod 0644 "$STAGE/usr/share/applications/slm.desktop"
 install -m 0644 "$ROOT"/README.md "$STAGE/usr/share/doc/$PKG/"
 install -m 0644 "$ROOT"/docs/*.md "$STAGE/usr/share/doc/$PKG/"
 [[ -f "$ROOT/LICENSE" ]] && install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/$PKG/copyright"

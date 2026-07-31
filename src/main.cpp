@@ -39,6 +39,10 @@
 #include "memory.h"
 #include "model.h"
 #include "qmodel.h"
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
+
 #include "agent/runtime.h"
 #include "spt_assets.h"
 #include "telemetry.h"
@@ -154,6 +158,7 @@ void print_usage() {
       "                two models, weighted debate, tools and codebase retrieval.\n"
       "                [--gguf F.gguf] [--fast-mult N] [--strong-mult N] [--voices N]\n"
       "                [--index [DIR]] [--workspace DIR] [--transcript] [--yes]\n"
+      "  fetch-model   olmo | list                        download the ready model\n"
       "  info          [--config F]                       environment + memory budget\n"
       "  tokenizer     --out F [--vocab 4096]             train a byte level BPE\n"
       "                (--input F | --mix fa=F:0.4,en=F:0.3,py=F:0.3) [--no-normalize]\n"
@@ -1451,7 +1456,7 @@ int cmd_agent(const Args& a) {
   ro.enable_codebase = !a.flag("no-codebase");
   ro.index_cache = a.str("index-cache", workdir + "/codebase.idx");
   ro.tel = &tel;
-  ro.gguf = a.str("gguf", std::getenv("SLM_GGUF") ? std::getenv("SLM_GGUF") : "");
+  ro.gguf = a.str("gguf", std::getenv("SLM_GGUF") ? std::getenv("SLM_GGUF") : find_gguf());
   ro.gguf_ctx = static_cast<int>(a.integer("gguf-ctx", 4096));
   ro.gguf_threads = static_cast<int>(a.integer("gguf-threads", 0));
   ro.gguf_gpu_layers = static_cast<int>(a.integer("gguf-gpu-layers", 0));
@@ -1638,6 +1643,162 @@ int cmd_agent(const Args& a) {
     if (!std::getline(std::cin, line) || line.empty()) break;
     run_one(line);
   }
+  return 0;
+}
+
+// ============================================================ slm fetch-model
+// Downloads the ready-made model.  A 4.5 GB transfer needs resume and a progress
+// indicator, and curl already does both correctly, so this shells out to it with
+// an argv array (never a shell string) rather than reimplementing HTTP ranges.
+namespace {
+
+struct GgufChoice {
+  const char* key;
+  const char* repo;
+  const char* file;
+  const char* note;
+  double gib;
+};
+
+// Only Instruct and Think have GGUF conversions; Olmo-3-7B *Base* does not, and
+// a base model cannot follow "criticise this answer" anyway, so Instruct is the
+// default for the debate role.
+const GgufChoice kGgufs[] = {
+    {"olmo", "bartowski/allenai_Olmo-3-7B-Instruct-GGUF",
+     "allenai_Olmo-3-7B-Instruct-Q4_K_M.gguf",
+     "OLMo 3 7B Instruct, Q4_K_M - the default: best quality per byte", 4.5},
+    {"olmo-q5", "bartowski/allenai_Olmo-3-7B-Instruct-GGUF",
+     "allenai_Olmo-3-7B-Instruct-Q5_K_M.gguf",
+     "OLMo 3 7B Instruct, Q5_K_M - ~1-2% better, ~20% slower, 5.4 GB", 5.4},
+    {"olmo-q3", "bartowski/allenai_Olmo-3-7B-Instruct-GGUF",
+     "allenai_Olmo-3-7B-Instruct-Q3_K_M.gguf",
+     "OLMo 3 7B Instruct, Q3_K_M - only if RAM is tight, visibly worse", 3.6},
+    {"olmo-think", "bartowski/allenai_Olmo-3-7B-Think-GGUF",
+     "allenai_Olmo-3-7B-Think-Q4_K_M.gguf",
+     "OLMo 3 7B Think, Q4_K_M - reasoning traces, slower to answer", 4.5},
+};
+
+// Runs curl with an argv array so a URL can never be interpreted as a command.
+bool run_curl(const std::vector<std::string>& args, std::string* err) {
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+  const pid_t pid = fork();
+  if (pid < 0) {
+    if (err) *err = "fork failed";
+    return false;
+  }
+  if (pid == 0) {
+    execvp(argv[0], argv.data());
+    _exit(127);
+  }
+  int st = 0;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+  }
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    if (err)
+      *err = "curl exited with " +
+             std::to_string(WIFEXITED(st) ? WEXITSTATUS(st) : -1) +
+             " (a partial file is kept; run the same command again to resume)";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int cmd_fetch_model(const Args& a) {
+  const std::vector<std::string>& pos = a.positional();
+  const std::string want = pos.empty() ? a.str("model", "olmo") : pos[0];
+
+  if (want == "list" || a.flag("list")) {
+    std::printf("available ready-made models:\n\n");
+    for (const GgufChoice& g : kGgufs)
+      std::printf("  %-12s %5.1f GB  %s\n", g.key, g.gib, g.note);
+    std::printf("\nusage: slm fetch-model olmo\n");
+    return 0;
+  }
+
+  const GgufChoice* pick = nullptr;
+  for (const GgufChoice& g : kGgufs)
+    if (want == g.key) pick = &g;
+  if (!pick) {
+    std::fprintf(stderr,
+                 "unknown model '%s'.  Try `slm fetch-model list`.\n", want.c_str());
+    return 2;
+  }
+
+  const std::string dir = a.str("dir", spt_user_dir() + "/models");
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (ec) {
+    std::fprintf(stderr, "cannot create %s: %s\n", dir.c_str(), ec.message().c_str());
+    return 1;
+  }
+  const std::string dest = dir + "/" + pick->file;
+  const std::string url = std::string("https://huggingface.co/") + pick->repo +
+                          "/resolve/main/" + pick->file + "?download=true";
+
+  // Already there and plausibly complete?
+  if (std::filesystem::is_regular_file(dest, ec)) {
+    const double have = static_cast<double>(std::filesystem::file_size(dest, ec));
+    if (have > pick->gib * 0.95e9) {
+      std::printf("already downloaded: %s (%s)\n", dest.c_str(),
+                  human_bytes(have).c_str());
+      std::printf("\nuse it:\n  slm up --gguf %s\n", dest.c_str());
+      return 0;
+    }
+    std::printf("resuming a partial download (%s of ~%.1f GB)\n",
+                human_bytes(have).c_str(), pick->gib);
+  }
+
+  std::printf("%s\n", pick->note);
+  std::printf("  from %s\n  to   %s\n  ~%.1f GB - this takes a while\n\n",
+              pick->repo, dest.c_str(), pick->gib);
+  if (!a.flag("yes")) {
+    std::printf("continue? [Y/n] ");
+    std::fflush(stdout);
+    std::string line;
+    if (std::getline(std::cin, line) && !line.empty() &&
+        (line[0] == 'n' || line[0] == 'N')) {
+      std::printf("cancelled\n");
+      return 1;
+    }
+  }
+
+  std::string err;
+  const std::vector<std::string> args = {
+      "curl", "-L", "--fail", "--proto", "=https", "-C", "-", "--retry", "5",
+      "--retry-delay", "3", "--retry-all-errors", "--progress-bar",
+      "-o", dest, url};
+  const double t0 = now_seconds();
+  if (!run_curl(args, &err)) {
+    std::fprintf(stderr, "\ndownload failed: %s\n", err.c_str());
+    return 1;
+  }
+  const double dt = now_seconds() - t0;
+  const double sz = static_cast<double>(std::filesystem::file_size(dest, ec));
+  std::printf("\ndownloaded %s in %.0f s (%.1f MB/s)\n", human_bytes(sz).c_str(), dt,
+              sz / 1e6 / std::max(1.0, dt));
+
+  // Sanity check: a GGUF starts with the magic "GGUF".
+  {
+    std::ifstream f(dest, std::ios::binary);
+    char magic[4] = {0};
+    f.read(magic, 4);
+    if (std::memcmp(magic, "GGUF", 4) != 0) {
+      std::fprintf(stderr,
+                   "warning: %s does not start with the GGUF magic - the download "
+                   "may be an error page.  Delete it and try again.\n", dest.c_str());
+      return 1;
+    }
+  }
+  std::printf("\nOLMo is installed.  `slm up` will find it automatically.\n");
+  if (!ModelBackendGGUF::compiled_in())
+    std::printf(
+        "\nNOTE: this binary was built without llama.cpp, so it cannot load a "
+        "GGUF yet.\n      Rebuild with:  ./build.sh --llama\n");
   return 0;
 }
 
@@ -1893,14 +2054,22 @@ int cmd_bench(const Args& a) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    print_usage();
-    return 2;
+    // No arguments means "start": someone who installed a package and typed the
+    // program's name wants the dashboard, not a usage screen.
+    Args none(0, nullptr);
+    try {
+      return cmd_up(none);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "\nerror: %s\n", e.what());
+      return 1;
+    }
   }
   const std::string cmd = argv[1];
   Args a(argc - 2, argv + 2);
   try {
     if (cmd == "up") return cmd_up(a);
     if (cmd == "agent") return cmd_agent(a);
+    if (cmd == "fetch-model" || cmd == "fetch") return cmd_fetch_model(a);
     if (cmd == "info") return cmd_info(a);
     if (cmd == "tokenizer") return cmd_tokenizer(a);
     if (cmd == "pretrain") return cmd_pretrain(a);
