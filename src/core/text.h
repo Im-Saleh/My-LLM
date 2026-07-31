@@ -108,4 +108,8 @@ struct CodeCheck {
 // consistent indentation, no stray tabs, plausible statement shape.
 CodeCheck check_python(const std::string& code);
 
+// "4.29 GiB" - byte counts appear in the CLI, the dashboard and the audit log,
+// and they must read the same in all three.
+std::string human_bytes(double bytes);
+
 }  // namespace slm

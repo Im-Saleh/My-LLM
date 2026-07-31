@@ -702,6 +702,18 @@ std::vector<int32_t> GPT::generate(const std::vector<int32_t>& prompt, const Gen
     }
     for (auto& c : cand) c.first = static_cast<float>(c.first / sum);
 
+    if (opt.min_p > 0.0f && cand.size() > 1) {
+      // Relative floor, so it scales with how peaked this step happens to be.
+      const float floor_p = opt.min_p * cand[0].first;
+      size_t keep_n = 1;
+      while (keep_n < cand.size() && cand[keep_n].first >= floor_p) ++keep_n;
+      if (keep_n < cand.size()) {
+        cand.resize(keep_n);
+        double s2 = 0.0;
+        for (const auto& c : cand) s2 += c.first;
+        for (auto& c : cand) c.first = static_cast<float>(c.first / s2);
+      }
+    }
     if (opt.top_p > 0.0f && opt.top_p < 1.0f) {
       double acc = 0.0;
       size_t keep_n = 0;

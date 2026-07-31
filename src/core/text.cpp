@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "core/text.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -529,6 +531,18 @@ CodeCheck check_python(const std::string& code) {
   }
   r.ok = true;
   return r;
+}
+
+std::string human_bytes(double b) {
+  const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  int i = 0;
+  while (b >= 1024.0 && i < 4) {
+    b /= 1024.0;
+    ++i;
+  }
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.2f %s", b, u[i]);
+  return buf;
 }
 
 }  // namespace slm

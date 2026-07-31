@@ -31,6 +31,8 @@
 #include <thread>
 #include <vector>
 
+#include "agent/runtime.h"
+#include "gui_agent.h"
 #include "qmodel.h"
 
 #include "gui_text.h"
@@ -374,6 +376,430 @@ void memory_panel(DashboardContext& ctx, char* buf, size_t buf_size) {
   ImGui::EndChild();
 }
 
+// ======================================================== agent / debate panels
+// UI state that has to survive between frames.  Kept in one struct so the frame
+// loop stays readable and so nothing here is accidentally re-initialised.
+struct AgentUi {
+  int mode = 0;                 // index into kModeNames
+  int fast_mult = 2;
+  int strong_mult = 1;
+  int voices = 2;
+  bool use_tools = true;
+  bool use_codebase = true;
+  int max_tokens = 320;
+  char input[2048] = {0};
+  char index_root[512] = {0};
+  char dataset[512] = {0};
+  int dataset_max_lines = 0;    // 0 = the whole file
+  int dataset_chunk = 800;
+  int open_round = -1;
+  bool show_context = false;
+};
+
+const char* const kModeNames[4] = {"fast (SPT only)", "strong (GGUF only)",
+                                   "debate (both, weighted)", "self-debate (SPT x N)"};
+AskMode mode_of(int i) {
+  switch (i) {
+    case 1: return AskMode::kStrong;
+    case 2: return AskMode::kDebate;
+    case 3: return AskMode::kSelfDebate;
+    default: return AskMode::kFast;
+  }
+}
+
+// The model selector: which model answers, and with what weight.  This is the
+// one control that changes the cost of everything else, so it shows the live
+// state of each backend right next to the choice.
+void model_selector(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.agent) {
+    ImGui::TextDisabled("agent runtime unavailable");
+    return;
+  }
+  ImGui::SetNextItemWidth(230);
+  ImGui::Combo("model", &ui.mode, kModeNames, 4);
+  const AskMode m = mode_of(ui.mode);
+  const bool needs_strong = (m == AskMode::kStrong || m == AskMode::kDebate);
+  if (needs_strong && !ctx.agent->mode_available(m)) {
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "no GGUF configured");
+  }
+  if (m == AskMode::kDebate) {
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderInt("SPT x", &ui.fast_mult, 1, 5);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderInt("GGUF x", &ui.strong_mult, 1, 5);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d rounds", std::max(ui.fast_mult, ui.strong_mult));
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "The multiplier is both the vote weight and how often a model takes "
+          "part: with 2x and 1x the debate runs 2 critique rounds, the 2x model "
+          "joins both, the 1x model one.");
+  } else if (m == AskMode::kSelfDebate) {
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderInt("voices", &ui.voices, 2, 4);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderInt("rounds x", &ui.fast_mult, 1, 4);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "The same weights debating themselves: separate KV caches, separate "
+          "seeds and different personas, so the voices genuinely disagree.");
+  }
+  ImGui::Checkbox("tools", &ui.use_tools);
+  ImGui::SameLine();
+  ImGui::Checkbox("codebase context", &ui.use_codebase);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110);
+  ImGui::SliderInt("max tok", &ui.max_tokens, 64, 1024);
+
+  ImGui::Separator();
+  for (const BackendPtr& b : ctx.agent->backends().all()) {
+    const BackendStatus s = b->status();
+    const ImVec4 col = s.loaded ? ImVec4(0.6f, 0.95f, 0.7f, 1.0f)
+                                : ImVec4(0.7f, 0.7f, 0.75f, 1.0f);
+    ImGui::TextColored(col, "%s", s.loaded ? "*" : "o");
+    ImGui::SameLine();
+    ImGui::Text("%-14s %s", b->display_name().c_str(), b->runtime().c_str());
+    if (s.loaded) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("%.1fM  %.0f MiB%s%s", s.params / 1e6,
+                          s.weight_bytes / (1024.0 * 1024.0),
+                          s.kv_bytes ? "  +KV " : "",
+                          s.kv_bytes ? human_bytes(static_cast<double>(s.kv_bytes)).c_str()
+                                     : "");
+      if (s.last_decode_tps > 0.0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%.0f tok/s", s.last_decode_tps);
+      }
+      if (s.cache_hit_tokens > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("| %lld cached",
+                            static_cast<long long>(s.cache_hit_tokens));
+      }
+    } else {
+      ImGui::SameLine();
+      if (ImGui::SmallButton((std::string("load##") + b->id()).c_str())) {
+        std::string err;
+        if (!b->load(&err)) ctx.tel->log("warn", "agent", "load failed: " + err);
+      }
+      if (!s.error.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.45f, 1.0f), "%s",
+                           utf8_truncate(s.error, 60).c_str());
+      }
+    }
+  }
+  const size_t w = ctx.agent->backends().weight_bytes();
+  const size_t kv = ctx.agent->backends().kv_bytes();
+  ImGui::TextDisabled("resident: %s weights + %s KV", human_bytes(static_cast<double>(w)).c_str(),
+                      human_bytes(static_cast<double>(kv)).c_str());
+}
+
+// The debate view: what each model said, what it criticised, and the scores that
+// decided the winner.  Progress is the engine's own estimate of work completed,
+// weighted by each backend's measured speed, not a count of rounds.
+void debate_panel(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.actrl || !ctx.actrl->attached()) {
+    ImGui::TextDisabled("agent not attached");
+    return;
+  }
+  const AgentSnapshot snap = ctx.actrl->snapshot();
+
+  if (snap.busy) {
+    ImGui::ProgressBar(static_cast<float>(snap.progress), ImVec2(-90, 0));
+    ImGui::SameLine();
+    if (ImGui::Button("cancel", ImVec2(80, 0))) ctx.actrl->cancel();
+    ImGui::TextDisabled("%s", utf8_truncate(snap.question, 90).c_str());
+  }
+
+  ImGui::BeginChild("debatebody", ImVec2(0, -64), ImGuiChildFlags_Border);
+  const DebateTranscript* live = nullptr;
+  if (snap.busy && !snap.live.rounds.empty()) live = &snap.live;
+  else if (!snap.history.empty() && snap.history.back().was_debate)
+    live = &snap.history.back().debate;
+
+  if (live) {
+    for (const DebateRound& r : live->rounds) {
+      const ImVec4 col = r.kind == "draft"    ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f)
+                         : r.kind == "critique" ? ImVec4(1.0f, 0.85f, 0.5f, 1.0f)
+                                                : ImVec4(0.6f, 0.95f, 0.7f, 1.0f);
+      ImGui::PushStyleColor(ImGuiCol_Text, col);
+      const bool open = ImGui::TreeNodeEx(
+          reinterpret_cast<const void*>(static_cast<intptr_t>(r.index + 1)),
+          r.index == live->rounds.size() - 1 ? ImGuiTreeNodeFlags_DefaultOpen : 0,
+          "round %d - %s (%zu answers, %.2fs)", r.index, r.kind.c_str(),
+          r.answers.size(), r.seconds);
+      ImGui::PopStyleColor();
+      if (!open) continue;
+      if (!r.note.empty()) ImGui::TextDisabled("%s", r.note.c_str());
+      for (size_t i = 0; i < r.answers.size(); ++i) {
+        const DebateAnswer& a = r.answers[i];
+        ImGui::PushID(static_cast<int>(r.index * 100 + i));
+        ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f), "%s#%d", a.participant.c_str(),
+                           a.draft);
+        ImGui::SameLine();
+        ImGui::TextDisabled("score %.3f | agree %.0f%% | judge %.1f/10 (%d) | %d tok",
+                            a.score, 100.0 * a.cluster_mass, a.judge_score,
+                            a.judge_votes, a.gen_tokens);
+        if (a.reused_tokens > 0) {
+          ImGui::SameLine();
+          ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, 1.0f), "| %d cached",
+                             a.reused_tokens);
+        }
+        if (!a.critique.empty()) {
+          const ImVec4 amber(1.0f, 0.85f, 0.45f, 1.0f);
+          ui_wrapped("critique: " + a.critique, &amber);
+        }
+        ui_wrapped(a.text);
+        ImGui::Separator();
+        ImGui::PopID();
+      }
+      ImGui::TreePop();
+    }
+    if (!live->decision_log.empty()) {
+      const ImVec4 dim(0.65f, 0.8f, 0.95f, 1.0f);
+      ui_wrapped(live->decision_log, &dim);
+    }
+    if (!live->usage.empty()) {
+      for (const DebateTranscript::Usage& u : live->usage)
+        ImGui::TextDisabled("%s: %d calls, %d generated, %d reused, %.2fs",
+                            u.backend_id.c_str(), u.calls, u.gen_tokens,
+                            u.reused_tokens, u.seconds);
+    }
+  } else if (!snap.partial.empty()) {
+    const ImVec4 amber(1.0f, 0.85f, 0.4f, 1.0f);
+    ui_wrapped(snap.partial, &amber);
+  } else if (!snap.history.empty()) {
+    const AgentTurn& t = snap.history.back();
+    ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "you:");
+    ImGui::SameLine();
+    ui_wrapped(t.question);
+    ImGui::TextColored(ImVec4(0.65f, 0.95f, 0.7f, 1.0f), "%s:",
+                       ask_mode_name(t.mode));
+    ui_wrapped(t.answer.empty() ? ("(" + t.error + ")") : t.answer);
+    ImGui::TextDisabled("%.2fs, %d prompt (%d reused), %d generated", t.seconds,
+                        t.prompt_tokens, t.reused_tokens, t.gen_tokens);
+    if (!t.tools.empty()) {
+      for (const ToolTrace& tt : t.tools)
+        ImGui::TextDisabled("  tool %s %s -> %s (%.2fs)", tt.tool.c_str(),
+                            tt.args.c_str(),
+                            tt.denied ? "denied" : (tt.ok ? "ok" : "failed"),
+                            tt.seconds);
+    }
+    if (!t.context_used.empty()) {
+      ImGui::Checkbox("show retrieved context", &ui.show_context);
+      if (ui.show_context) {
+        const ImVec4 dim(0.6f, 0.7f, 0.8f, 1.0f);
+        ui_wrapped(t.context_used, &dim);
+      }
+    }
+  } else {
+    ImGui::TextDisabled(
+        "ask something. 'fast' uses SPT alone; 'debate' has both models answer, "
+        "criticise each other and synthesise, weighted by the multipliers.");
+  }
+  if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
+  ImGui::EndChild();
+
+  ImGui::SetNextItemWidth(-150);
+  const bool enter = ImGui::InputText("##agentin", ui.input, sizeof(ui.input),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+  ImGui::SameLine();
+  const bool send = ImGui::Button("ask", ImVec2(60, 0));
+  ImGui::SameLine();
+  if (ImGui::Button("clear", ImVec2(60, 0))) ctx.actrl->clear_history();
+  if ((enter || send) && ui.input[0] != '\0' && !snap.busy) {
+    ctx.actrl->ask(ui.input, mode_of(ui.mode), ui.fast_mult, ui.strong_mult, ui.voices,
+                   ui.use_tools, ui.use_codebase, ui.max_tokens);
+    ui.input[0] = '\0';
+  }
+  if (ui.input[0] != '\0' && needs_shaping(ui.input)) ui_line(ui.input);
+}
+
+// Codebase panel: index a folder, see what is in the index, and search it.
+void codebase_panel(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.agent || !ctx.actrl) {
+    ImGui::TextDisabled("agent runtime unavailable");
+    return;
+  }
+  if (ui.index_root[0] == '\0')
+    std::snprintf(ui.index_root, sizeof(ui.index_root), "%s",
+                  ctx.agent->options().workspace.c_str());
+  ImGui::SetNextItemWidth(-150);
+  ImGui::InputText("folder", ui.index_root, sizeof(ui.index_root));
+  ImGui::SameLine();
+  const IndexJob job = ctx.actrl->index_job();
+  if (job.running) {
+    if (ImGui::Button("stop", ImVec2(60, 0))) ctx.actrl->stop_jobs();
+  } else if (ImGui::Button("index", ImVec2(60, 0))) {
+    ctx.actrl->start_index(ui.index_root);
+  }
+  if (job.running) {
+    const float f = job.files_total > 0
+                        ? static_cast<float>(job.files_done) / static_cast<float>(job.files_total)
+                        : 0.0f;
+    ImGui::ProgressBar(f, ImVec2(-1, 0));
+    ImGui::TextDisabled("%lld/%lld  %s", static_cast<long long>(job.files_done),
+                        static_cast<long long>(job.files_total),
+                        utf8_truncate(job.current, 60).c_str());
+  } else if (!job.error.empty()) {
+    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.45f, 1.0f), "%s", job.error.c_str());
+  }
+
+  const IndexStats st = ctx.agent->codebase().stats();
+  if (st.chunks > 0) {
+    ImGui::Text("%lld files, %lld chunks, %lld tokens", static_cast<long long>(st.files),
+                static_cast<long long>(st.chunks), static_cast<long long>(st.tokens));
+    ImGui::TextDisabled("%s embeddings, %.1f MiB, %.2fs scan + %.2fs embed",
+                        st.embedder.c_str(), st.memory_bytes / (1024.0 * 1024.0),
+                        st.scan_seconds, st.embed_seconds);
+    if (st.skipped_ignored || st.skipped_binary || st.skipped_large)
+      ImGui::TextDisabled("skipped: %lld ignored, %lld binary, %lld too large",
+                          static_cast<long long>(st.skipped_ignored),
+                          static_cast<long long>(st.skipped_binary),
+                          static_cast<long long>(st.skipped_large));
+    ImGui::Separator();
+    ImGui::BeginChild("langs", ImVec2(0, 90), ImGuiChildFlags_Border);
+    for (const auto& l : st.by_language)
+      ImGui::TextDisabled("  %-12s %lld chunks", l.first.c_str(),
+                          static_cast<long long>(l.second));
+    ImGui::EndChild();
+    ImGui::TextWrapped(
+        "The index is used automatically for questions that look like code "
+        "questions, and through the code_search / find_symbol / repo_overview "
+        "tools for anything else.");
+  } else {
+    ImGui::TextDisabled("nothing indexed yet");
+  }
+}
+
+// Dataset panel: point it at a file and the continual thread learns from it.
+void dataset_panel(DashboardContext& ctx, AgentUi& ui) {
+  if (!ctx.actrl) {
+    ImGui::TextDisabled("agent not attached");
+    return;
+  }
+  ImGui::TextWrapped(
+      "Give the model a dataset. The file is split into paragraph-sized samples "
+      "and fed to the continual-learning thread; the coordinator still validates "
+      "every resulting update on the hold-out set and rolls it back if quality "
+      "drops, so a bad dataset cannot silently damage the weights.");
+  ImGui::Separator();
+  ImGui::SetNextItemWidth(-150);
+  ImGui::InputText("file", ui.dataset, sizeof(ui.dataset));
+  ImGui::SameLine();
+  const TrainJob job = ctx.actrl->train_job();
+  if (job.running) {
+    if (ImGui::Button("stop", ImVec2(60, 0))) ctx.actrl->stop_jobs();
+  } else if (ImGui::Button("train", ImVec2(60, 0))) {
+    ctx.actrl->teach_dataset(ui.dataset, ui.dataset_max_lines, ui.dataset_chunk);
+  }
+  ImGui::SetNextItemWidth(150);
+  ImGui::InputInt("max lines (0=all)", &ui.dataset_max_lines);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(150);
+  ImGui::SliderInt("sample chars", &ui.dataset_chunk, 200, 4000);
+
+  if (job.running || job.done) {
+    ImGui::Separator();
+    ImGui::Text("%s", utf8_truncate(job.path, 70).c_str());
+    ImGui::Text("%lld lines read, %lld samples queued, %s", static_cast<long long>(job.lines),
+                static_cast<long long>(job.queued),
+                human_bytes(static_cast<double>(job.bytes)).c_str());
+    if (job.running) ImGui::TextDisabled("streaming...");
+    else ImGui::TextDisabled("finished in %.1fs", job.seconds);
+  }
+  if (!job.error.empty())
+    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.45f, 1.0f), "%s", job.error.c_str());
+
+  ImGui::Separator();
+  const TrainerState cl = ctx.tel->trainer(Source::kContinual);
+  ImGui::Text("continual thread: %lld pending, %lld steps, loss %.4f",
+              static_cast<long long>(cl.pending_inputs),
+              static_cast<long long>(cl.local_steps), cl.last_loss);
+  if (ctx.corpus && !ctx.corpus->empty())
+    ImGui::TextDisabled("corpus: %lld tokens across %d sources",
+                        static_cast<long long>(ctx.corpus->total_tokens()),
+                        ctx.corpus->num_sources());
+  ImGui::TextWrapped(
+      "For a full pre-training run on a large corpus use the command line "
+      "(slm pretrain --data F --steps N): it is much faster per token than the "
+      "continual path, which is designed for a steady trickle of new data.");
+}
+
+// Tool approval: the confirmation gate, as a modal so it cannot be missed.
+void approval_modal(DashboardContext& ctx) {
+  if (!ctx.agent) return;
+  const std::vector<PendingApproval> pend = ctx.agent->gate().pending();
+  if (pend.empty()) return;
+  ImGui::OpenPopup("tool approval");
+  if (ImGui::BeginPopupModal("tool approval", nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    const PendingApproval& p = pend.front();
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s wants to run %s",
+                       "the agent", p.tool.c_str());
+    ImGui::TextDisabled("risk: %s", tool_risk_name(p.risk));
+    ImGui::Separator();
+    ImGui::PushTextWrapPos(560.0f);
+    ImGui::TextUnformatted(p.preview.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::Separator();
+    if (ImGui::Button("allow", ImVec2(110, 0)))
+      ctx.agent->gate().decide(p.id, true, false);
+    ImGui::SameLine();
+    if (ImGui::Button("allow always", ImVec2(120, 0)))
+      ctx.agent->gate().decide(p.id, true, true);
+    ImGui::SameLine();
+    if (ImGui::Button("deny", ImVec2(110, 0)))
+      ctx.agent->gate().decide(p.id, false, false);
+    ImGui::SameLine();
+    if (ImGui::Button("deny all", ImVec2(110, 0))) ctx.agent->gate().deny_all();
+    if (pend.size() > 1)
+      ImGui::TextDisabled("%zu more waiting", pend.size() - 1);
+    ImGui::EndPopup();
+  }
+}
+
+// Which tools exist, and the policy for each risk level.
+void tools_panel(DashboardContext& ctx) {
+  if (!ctx.agent) {
+    ImGui::TextDisabled("agent runtime unavailable");
+    return;
+  }
+  ToolPolicy& pol = ctx.agent->policy();
+  const char* kModes[3] = {"ask", "allow", "deny"};
+  ImGui::TextDisabled("policy per risk level");
+  ImGui::SetNextItemWidth(110);
+  ImGui::Combo("safe", &pol.safe, kModes, 3);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110);
+  ImGui::Combo("network", &pol.network, kModes, 3);
+  ImGui::SetNextItemWidth(110);
+  ImGui::Combo("write", &pol.write, kModes, 3);
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110);
+  ImGui::Combo("shell", &pol.dangerous, kModes, 3);
+  ImGui::Separator();
+  for (const ToolSpec& s : ctx.agent->tools().specs()) {
+    bool on = s.enabled;
+    ImGui::PushID(s.name.c_str());
+    if (ImGui::Checkbox("##on", &on)) ctx.agent->tools().set_enabled(s.name, on);
+    ImGui::SameLine();
+    ImGui::Text("%-14s", s.name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%s] %s", tool_risk_name(s.risk), s.summary.c_str());
+    ImGui::PopID();
+  }
+  ImGui::Separator();
+  for (const ToolRegistry::Stat& st : ctx.agent->tools().stats())
+    ImGui::TextDisabled("%-14s %lld calls, %lld failed, %lld denied, %.2fs",
+                        st.name.c_str(), static_cast<long long>(st.calls),
+                        static_cast<long long>(st.failures),
+                        static_cast<long long>(st.denials), st.seconds);
+}
+
 void chat_panel(DashboardContext& ctx, char* input, size_t input_size) {
   ImGui::BeginChild("history", ImVec2(0, -70), ImGuiChildFlags_Border);
   std::vector<ChatTurn> h = ctx.chat->history();
@@ -496,6 +922,7 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   int layer = 0, head = 0;
   char input[1024] = {0};
   char mem_input[512] = {0};
+  AgentUi aui;
   const double t0 = Telemetry::now();
 
   while (!glfwWindowShouldClose(win) && !ctx.quit->load()) {
@@ -524,6 +951,16 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                 ctx.mcfg->describe().c_str(), ctx.mcfg->param_count() / 1e6, q4_mib,
                 backend_name(), static_cast<unsigned long long>(cs.weight_version),
                 Telemetry::now() - t0, backend_allocated_bytes() / (1024.0 * 1024.0));
+    if (ctx.actrl && ctx.actrl->attached()) {
+      const AgentSnapshot as = ctx.actrl->snapshot();
+      ImGui::SameLine();
+      if (as.busy)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "|  agent %.0f%%",
+                           100.0 * as.progress);
+      else if (as.pending_approvals)
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "|  %zu approvals waiting",
+                           as.pending_approvals);
+    }
     ImGui::SameLine(disp.x - 430);
     if (ctx.tel->stopped()) {
       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.2f, 1.0f));
@@ -557,12 +994,39 @@ int run_imgui_dashboard(DashboardContext& ctx) {
                 visible);
     ImGui::End();
 
-    // ----------------------------------------------------------- attention
+    // ------------------------------------- attention / agent / codebase / data
+    // One tabbed window instead of four: on a 1600x950 screen there is only room
+    // for one of these at a time, and tabs keep the layout stable.
     ImGui::SetNextWindowPos(ImVec2(0, 392), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(disp.x - 2 * col_w, disp.y - 392), ImGuiCond_Always);
-    ImGui::Begin("attention heat map", nullptr, ImGuiWindowFlags_NoMove);
-    attention_panel(*ctx.tel, *ctx.mcfg, &layer, &head);
+    ImGui::Begin("inspect", nullptr, ImGuiWindowFlags_NoMove);
+    if (ImGui::BeginTabBar("inspecttabs")) {
+      if (ImGui::BeginTabItem("agent")) {
+        model_selector(ctx, aui);
+        ImGui::Separator();
+        debate_panel(ctx, aui);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("attention")) {
+        attention_panel(*ctx.tel, *ctx.mcfg, &layer, &head);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("codebase")) {
+        codebase_panel(ctx, aui);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("dataset / train")) {
+        dataset_panel(ctx, aui);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("tools")) {
+        tools_panel(ctx);
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
     ImGui::End();
+    approval_modal(ctx);
 
     // -------------------------------------------------- self-training panel
     ImGui::SetNextWindowPos(ImVec2(disp.x - 2 * col_w, 62), ImGuiCond_Always);

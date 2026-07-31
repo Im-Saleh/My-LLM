@@ -24,6 +24,9 @@
 #include <thread>
 
 #include "app.h"
+#include "agent/runtime.h"
+#include "gui_agent.h"
+#include "spt_assets.h"
 #include "chat.h"
 #include "coordinator.h"
 #include "core/dataset.h"
@@ -220,30 +223,50 @@ class Autopilot {
 int run_self_training(const AppOptions& opt) {
   backend_init(opt.threads, opt.cuda);
 
+  // Zero-argument operation: when the caller did not name a model, find the one
+  // SPT model (or create a starter one).  Failing with "cannot load tokenizer
+  // 'run/tok.slmtok'" was the single most common way this program refused to
+  // start, and no user should have to know that path.
+  AppOptions o = opt;
+  if (o.ckpt.empty() || o.tokenizer.empty()) {
+    SptAssets a;
+    std::string err;
+    if (!resolve_spt(&a, true, &err,
+                     [](const std::string& m) { std::printf("  %s\n", m.c_str()); })) {
+      std::fprintf(stderr, "%s\n", err.c_str());
+      return 1;
+    }
+    if (o.ckpt.empty()) o.ckpt = a.ckpt;
+    if (o.tokenizer.empty()) o.tokenizer = a.tokenizer;
+    if (o.workdir.empty() || o.workdir == "runs") o.workdir = a.workdir;
+    if (!a.note.empty()) std::printf("  %s\n", a.note.c_str());
+  }
+  const AppOptions& opt_ref = o;
+
   Tokenizer tok;
-  if (!tok.load(opt.tokenizer)) {
-    std::fprintf(stderr, "cannot load tokenizer '%s'\n", opt.tokenizer.c_str());
+  if (!tok.load(opt_ref.tokenizer)) {
+    std::fprintf(stderr, "cannot load tokenizer '%s'\n", opt_ref.tokenizer.c_str());
     return 1;
   }
   ParamStore ps;
   CheckpointMeta meta;
-  if (!load_checkpoint(opt.ckpt, &ps, &meta)) {
-    std::fprintf(stderr, "cannot load checkpoint '%s'\n", opt.ckpt.c_str());
+  if (!load_checkpoint(opt_ref.ckpt, &ps, &meta)) {
+    std::fprintf(stderr, "cannot load checkpoint '%s'\n", opt_ref.ckpt.c_str());
     return 1;
   }
   GPTConfig mcfg = GPTConfig::from_config(meta.extra);
   mcfg.vocab_size = tok.vocab_size();
-  mcfg.grad_checkpointing = opt.cfg.get_bool("model.grad_checkpointing", true);
+  mcfg.grad_checkpointing = opt_ref.cfg.get_bool("model.grad_checkpointing", true);
 
   MixtureDataset ds;
-  if (opt.data.empty()) {
+  if (opt_ref.data.empty()) {
     std::fprintf(stderr,
                  "warning: no corpus given (--data F or --mix fa=F:0.4,en=F:0.3,py=F:0.3):\n"
                  "         replay, per-language hold-out gating and the autopilot are disabled\n");
   }
-  if (!opt.data.empty()) {
+  if (!opt_ref.data.empty()) {
     std::string err;
-    if (!ds.add_spec(opt.data, tok, &err))
+    if (!ds.add_spec(opt_ref.data, tok, &err))
       std::fprintf(stderr,
                    "warning: corpus not loaded (%s); replay and hold-out gating are disabled\n",
                    err.c_str());
@@ -252,19 +275,19 @@ int run_self_training(const AppOptions& opt) {
   }
 
   std::error_code ec;
-  std::filesystem::create_directories(opt.workdir, ec);
+  std::filesystem::create_directories(opt_ref.workdir, ec);
 
   Telemetry tel;
-  tel.open_audit(opt.workdir + "/audit.jsonl");
+  tel.open_audit(opt_ref.workdir + "/audit.jsonl");
   tel.log("info", "app", "session start",
           {{"backend", backend_name()},
            {"model", mcfg.describe()},
-           {"checkpoint", opt.ckpt},
+           {"checkpoint", opt_ref.ckpt},
            {"corpus_tokens", std::to_string(ds.total_tokens())},
            {"sources", std::to_string(ds.num_sources())}});
 
   // ------------------------------------------------- trainer configurations
-  const Config& c = opt.cfg;
+  const Config& c = opt_ref.cfg;
   TrainerConfig cl = trainer_defaults(c, "continual", 2e-5f, 2, 6.0, 50, 2);
   TrainerConfig sg = trainer_defaults(c, "selfgen", 1e-5f, 1, 12.0, 60, 2);
   TrainerConfig fb = trainer_defaults(c, "feedback", 3e-5f, 2, 8.0, 40, 2);
@@ -291,7 +314,7 @@ int run_self_training(const AppOptions& opt) {
   CoordinatorConfig ccfg = CoordinatorConfig::from_config(c);
   auto initial = std::make_shared<ParamStore>(ps);
   Coordinator coord(mcfg, initial, merge_space, ds.empty() ? nullptr : &ds, &tel, ccfg,
-                    opt.workdir);
+                    opt_ref.workdir);
 
   InteractionHub hub;
   GenOptions go;
@@ -303,7 +326,7 @@ int run_self_training(const AppOptions& opt) {
   MemoryStore memory;
   {
     const std::string mem_path =
-        c.get_str("memory.file", opt.workdir + "/memory.jsonl");
+        c.get_str("memory.file", opt_ref.workdir + "/memory.jsonl");
     if (memory.open(mem_path)) {
       chat.set_memory(&memory, static_cast<int>(c.get_int("memory.top_k", 3)));
       tel.log("info", "memory", "long term memory ready",
@@ -312,11 +335,47 @@ int run_self_training(const AppOptions& opt) {
   }
 
   ContinualTrainer t_cl(&coord, &tel, &hub, mcfg, cl, ContinualConfig::from_config(c),
-                        &tok, ds.empty() ? nullptr : &ds, opt.seed + 11);
+                        &tok, ds.empty() ? nullptr : &ds, opt_ref.seed + 11);
   SelfGenTrainer t_sg(&coord, &tel, mcfg, sg, SelfGenConfig::from_config(c), &tok,
-                      ds.empty() ? nullptr : &ds, opt.seed + 22);
+                      ds.empty() ? nullptr : &ds, opt_ref.seed + 22);
   FeedbackTrainer t_fb(&coord, &tel, &hub, mcfg, fb, FeedbackConfig::from_config(c),
-                       &tok, ds.empty() ? nullptr : &ds, opt.seed + 33);
+                       &tok, ds.empty() ? nullptr : &ds, opt_ref.seed + 33);
+
+  // ------------------------------------------------------- the agent runtime
+  // The live SPT backend reads the coordinator's published weights, so the model
+  // the agent answers with is the model the three threads are improving.  The
+  // second model is optional: without --gguf there is one model and the debate
+  // modes fall back to self-debate.
+  AgentRuntime agent;
+  AgentController actrl;
+  bool agent_ok = false;
+  {
+    AgentRuntimeOptions ao;
+    ao.spt_live = [&coord](uint64_t* v) { return coord.snapshot(v); };
+    ao.spt_cfg = mcfg;
+    ao.tok = &tok;
+    ao.tokenizer = opt_ref.tokenizer;
+    ao.workspace = opt_ref.workspace;
+    ao.workdir = opt_ref.workdir;
+    ao.index_cache = opt_ref.workdir + "/codebase.idx";
+    ao.gguf = opt_ref.gguf;
+    ao.gguf_ctx = static_cast<int>(c.get_int("gguf.ctx", 4096));
+    ao.gguf_threads = static_cast<int>(c.get_int("gguf.threads", 0));
+    ao.gguf_gpu_layers = static_cast<int>(c.get_int("gguf.gpu_layers", 0));
+    ao.gguf_kv_q8 = c.get_bool("gguf.kv_q8", false);
+    ao.tel = &tel;
+    std::string aerr;
+    agent_ok = agent.init(ao, &aerr);
+    if (!agent_ok)
+      tel.log("warn", "agent", "agent runtime unavailable: " + aerr);
+    else {
+      actrl.attach(&agent, &hub, &tel);
+      tel.log("info", "agent", "agent ready",
+              {{"backends", std::to_string(agent.backends().size())},
+               {"gguf", opt_ref.gguf.empty() ? "none" : opt_ref.gguf},
+               {"workspace", opt_ref.workspace}});
+    }
+  }
 
   std::atomic<bool> quit{false};
   DashboardContext ctx;
@@ -326,10 +385,13 @@ int run_self_training(const AppOptions& opt) {
   ctx.chat = &chat;
   ctx.tok = &tok;
   ctx.trainers = {&t_cl, &t_sg, &t_fb};
-  ctx.opt = &opt;
+  ctx.opt = &opt_ref;
   ctx.mcfg = &mcfg;
   ctx.quit = &quit;
   ctx.memory = &memory;
+  ctx.agent = agent_ok ? &agent : nullptr;
+  ctx.actrl = agent_ok ? &actrl : nullptr;
+  ctx.corpus = &ds;
 
   coord.start();
   chat.start();
@@ -337,9 +399,9 @@ int run_self_training(const AppOptions& opt) {
   t_sg.start();
   t_fb.start();
 
-  Autopilot autopilot(&tok, ds.empty() ? nullptr : &ds, &chat, &hub, &tel, opt.seed + 44,
+  Autopilot autopilot(&tok, ds.empty() ? nullptr : &ds, &chat, &hub, &tel, opt_ref.seed + 44,
                       c.get_num("autopilot.period_s", 6.0));
-  if (opt.autopilot) {
+  if (opt_ref.autopilot) {
     if (autopilot.available()) {
       tel.log("info", "autopilot", "enabled: synthesising user turns and ratings");
       autopilot.start();
@@ -349,7 +411,7 @@ int run_self_training(const AppOptions& opt) {
   }
 
   int rc = 0;
-  if (opt.headless)
+  if (opt_ref.headless)
     rc = run_terminal_dashboard(ctx);
   else if (gui_available())
     rc = run_imgui_dashboard(ctx);
@@ -371,10 +433,10 @@ int run_self_training(const AppOptions& opt) {
     CheckpointMeta m;
     m.step = coord.stats().rounds;
     mcfg.write_to(m.extra);
-    m.extra.set("tokenizer", opt.tokenizer);
+    m.extra.set("tokenizer", opt_ref.tokenizer);
     m.extra.set("coord.holdout_loss", std::to_string(coord.baseline().loss));
     m.extra.set("origin", "self-training session");
-    const std::string out = opt.workdir + "/final.slm";
+    const std::string out = opt_ref.workdir + "/final.slm";
     if (save_checkpoint(out, *final_ps, m, Dtype::F16))
       std::printf("\nsaved %s (holdout loss %.4f after %lld coordinator rounds)\n",
                   out.c_str(), coord.baseline().loss,

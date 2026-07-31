@@ -21,6 +21,10 @@ struct AppOptions {
   bool cuda = false;
   uint64_t seed = 1234;
   bool autopilot = false;  // synthesise user turns + ratings (demo / soak test)
+  // Optional second model (a GGUF for llama.cpp) and the root the agent tools are
+  // allowed to touch.  An empty gguf simply means "one model".
+  std::string gguf;
+  std::string workspace = ".";
   Config cfg;              // merged configuration
 };
 

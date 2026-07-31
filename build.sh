@@ -28,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --deb) DEB=1; shift ;;
     --run-tests|--test) TESTS=1; shift ;;
     --native) NATIVE=ON; shift ;;
+    --llama) EXTRA+=" -DSLM_WITH_LLAMA=ON"; [[ -d "${2:-}" ]] && { EXTRA+=" -DSLM_LLAMA_DIR=$2"; shift; }; shift ;;
     --libtorch) TORCH_DIR="${2:?--libtorch needs a path}"; shift 2 ;;
     --jobs|-j) JOBS="${2:?}"; shift 2 ;;
     --build-dir) BUILD_DIR="${2:?}"; shift 2 ;;

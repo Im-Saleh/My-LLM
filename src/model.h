@@ -126,6 +126,12 @@ struct GenOptions {
   float temperature = 0.9f;
   int top_k = 40;
   float top_p = 0.95f;
+  // Relative probability floor: drop every token whose probability is below
+  // min_p * p_max.  Unlike top_p it adapts to the shape of the distribution -
+  // when the model is confident almost nothing survives, when it is unsure the
+  // tail stays available - which is why it holds up at high temperature where
+  // top_p either clips too much or too little.  0 disables it.
+  float min_p = 0.0f;
   float repetition_penalty = 1.08f;
   uint64_t seed = 0;
   bool stop_on_eot = true;

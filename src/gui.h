@@ -16,7 +16,9 @@
 #include <vector>
 
 #include "app.h"
+#include "gui_agent.h"
 #include "chat.h"
+#include "core/dataset.h"
 #include "coordinator.h"
 #include "interaction.h"
 #include "memory.h"
@@ -37,6 +39,12 @@ struct DashboardContext {
   const GPTConfig* mcfg = nullptr;
   std::atomic<bool>* quit = nullptr;
   MemoryStore* memory = nullptr;
+  // The agent side: two models, the debate, the tools and the codebase index.
+  // Both may be null (a build without an agent, or a model that failed to load),
+  // and every panel checks before using them.
+  AgentRuntime* agent = nullptr;
+  AgentController* actrl = nullptr;
+  MixtureDataset* corpus = nullptr;   // for the dataset panel's statistics
 };
 
 // Pushes up to `n` memories into the continual-learning buffer so they end up in

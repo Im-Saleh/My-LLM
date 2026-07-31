@@ -39,6 +39,9 @@
 #include "memory.h"
 #include "model.h"
 #include "qmodel.h"
+#include "agent/runtime.h"
+#include "spt_assets.h"
+#include "telemetry.h"
 #include "tokenizer.h"
 
 using namespace slm;
@@ -121,18 +124,6 @@ double now_seconds() {
   return std::chrono::duration<double>(clock::now() - t0).count();
 }
 
-std::string human_bytes(double b) {
-  const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-  int i = 0;
-  while (b >= 1024.0 && i < 4) {
-    b /= 1024.0;
-    ++i;
-  }
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%.2f %s", b, u[i]);
-  return buf;
-}
-
 // Builds the corpus mixture from --mix (weighted, multi language) or --data.
 bool build_mixture(const Args& a, const Tokenizer& tok, MixtureDataset* mix,
                    bool required = true) {
@@ -156,6 +147,13 @@ void print_usage() {
       "\n"
       "usage: slm <command> [options]\n"
       "\n"
+      "  up                                               <- START HERE\n"
+      "                finds (or creates) the one SPT model and opens the dashboard.\n"
+      "                no arguments needed.  [--terminal] [--gguf F.gguf] [--where]\n"
+      "  agent         [--ask S] [--mode fast|strong|debate|self]\n"
+      "                two models, weighted debate, tools and codebase retrieval.\n"
+      "                [--gguf F.gguf] [--fast-mult N] [--strong-mult N] [--voices N]\n"
+      "                [--index [DIR]] [--workspace DIR] [--transcript] [--yes]\n"
       "  info          [--config F]                       environment + memory budget\n"
       "  tokenizer     --out F [--vocab 4096]             train a byte level BPE\n"
       "                (--input F | --mix fa=F:0.4,en=F:0.3,py=F:0.3) [--no-normalize]\n"
@@ -1357,6 +1355,292 @@ int cmd_qeval(const Args& a) {
   return 0;
 }
 
+
+// ====================================================================== slm up
+// One command, no arguments: find (or create) the model and open the dashboard.
+int cmd_up(const Args& a) {
+  if (a.flag("where")) {
+    std::printf("SLM_HOME  : %s\n",
+                std::getenv("SLM_HOME") ? std::getenv("SLM_HOME") : "(unset)");
+    std::printf("user data : %s\n", spt_user_dir().c_str());
+    std::printf("\nsearched in order:\n");
+    for (const std::string& d : spt_search_dirs()) {
+      std::error_code ec;
+      const bool tok = std::filesystem::is_regular_file(d + "/spt.slmtok", ec);
+      const bool ck = std::filesystem::is_regular_file(d + "/spt.slm", ec);
+      const bool q4 = std::filesystem::is_regular_file(d + "/spt-q4.slmq", ec);
+      std::printf("  %-44s %s%s%s\n", d.c_str(), tok ? "spt.slmtok " : "",
+                  ck ? "spt.slm " : "", q4 ? "spt-q4.slmq" : "");
+    }
+    return 0;
+  }
+
+  SptAssets assets;
+  std::string err;
+  std::printf("slm up\n");
+  if (!resolve_spt(&assets, !a.flag("no-bootstrap"), &err,
+                   [](const std::string& m) { std::printf("  %s\n", m.c_str()); })) {
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return 1;
+  }
+  if (assets.bootstrapped) std::printf("\n  %s\n\n", assets.note.c_str());
+
+  AppOptions o;
+  if (a.has("config")) o.cfg.load(a.str("config"));
+  a.apply_sets(&o.cfg);
+  o.ckpt = a.str("ckpt", assets.ckpt);
+  o.tokenizer = a.str("tokenizer", assets.tokenizer);
+  o.workdir = a.str("workdir", assets.workdir);
+  // A corpus is optional; without one, replay and the hold-out gate are off, and
+  // the dashboard says so rather than refusing to start.
+  o.data = a.has("mix") ? a.str("mix") : a.str("data");
+  if (o.data.empty()) {
+    for (const char* p : {"data/mixed.txt", "data/fa.txt", "data/sample_corpus.txt"}) {
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(p, ec)) {
+        o.data = p;
+        std::printf("  corpus: %s\n", p);
+        break;
+      }
+    }
+  }
+  o.headless = a.flag("terminal") || a.flag("headless") ||
+               (std::getenv("DISPLAY") == nullptr && std::getenv("WAYLAND_DISPLAY") == nullptr);
+  if (o.headless && !a.flag("terminal") && !a.flag("headless"))
+    std::printf("  no display detected - using the terminal dashboard\n");
+  o.seconds = a.num("seconds", 0.0);
+  o.threads = static_cast<int>(a.integer("threads", 0));
+  o.cuda = a.flag("cuda");
+  o.seed = static_cast<uint64_t>(a.integer("seed", 1234));
+  o.autopilot = a.flag("autopilot");
+  o.gguf = a.str("gguf", std::getenv("SLM_GGUF") ? std::getenv("SLM_GGUF") : "");
+  o.workspace = a.str("workspace", ".");
+  std::printf("\n");
+  return run_self_training(o);
+}
+
+// ==================================================================== slm agent
+// The dual-model agent from the command line: one model, the other model, or a
+// weighted debate between them, with tools and codebase retrieval.
+int cmd_agent(const Args& a) {
+  set_threads(a);
+  backend_init(static_cast<int>(a.integer("threads", 0)), a.flag("cuda"));
+
+  SptAssets assets;
+  std::string err;
+  if (!resolve_spt(&assets, true, &err, nullptr)) {
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return 1;
+  }
+
+  Telemetry tel;
+  const std::string workdir = a.str("workdir", assets.workdir);
+  std::error_code ec;
+  std::filesystem::create_directories(workdir, ec);
+  tel.open_audit(workdir + "/audit.jsonl");
+
+  AgentRuntimeOptions ro;
+  // int4 for pure inference when it exists: same answers, a fraction of the RAM.
+  if (!assets.quant.empty() && !a.flag("f32")) ro.spt_quant = assets.quant;
+  else ro.spt_ckpt = assets.ckpt;
+  ro.tokenizer = assets.tokenizer;
+  ro.workspace = a.str("workspace", ".");
+  ro.workdir = workdir;
+  ro.enable_web = !a.flag("no-web");
+  ro.enable_shell = !a.flag("no-shell");
+  ro.enable_codebase = !a.flag("no-codebase");
+  ro.index_cache = a.str("index-cache", workdir + "/codebase.idx");
+  ro.tel = &tel;
+  ro.gguf = a.str("gguf", std::getenv("SLM_GGUF") ? std::getenv("SLM_GGUF") : "");
+  ro.gguf_ctx = static_cast<int>(a.integer("gguf-ctx", 4096));
+  ro.gguf_threads = static_cast<int>(a.integer("gguf-threads", 0));
+  ro.gguf_gpu_layers = static_cast<int>(a.integer("gguf-gpu-layers", 0));
+  ro.gguf_kv_q8 = a.flag("kv-q8");
+  ro.gguf_base = a.flag("gguf-base");
+
+  AgentRuntime rt;
+  if (!rt.init(ro, &err)) {
+    std::fprintf(stderr, "agent: %s\n", err.c_str());
+    return 1;
+  }
+  // Non-interactive runs cannot answer an approval dialog, so the policy has to
+  // be explicit: --yes to allow, otherwise risky tools are refused, never hung.
+  if (a.flag("yes")) {
+    rt.policy().write = 1;
+    rt.policy().dangerous = 1;
+  } else {
+    rt.policy().write = 2;
+    rt.policy().dangerous = 2;
+  }
+  rt.policy().timeout_s = a.num("approve-timeout", 60.0);
+
+  if (a.has("index")) {
+    const std::string root = a.str("index", ro.workspace);
+    std::printf("indexing %s\n", root.c_str());
+    std::atomic<bool> stop{false};
+    int64_t last = -1;
+    if (!rt.index_codebase(
+            root,
+            [&](int64_t done, int64_t total, const std::string& path) {
+              if (total <= 0 || done == last) return;
+              last = done;
+              std::printf("\r  %lld/%lld  %-56s", static_cast<long long>(done),
+                          static_cast<long long>(total),
+                          utf8_truncate(path, 56).c_str());
+              std::fflush(stdout);
+            },
+            &stop, &err)) {
+      std::fprintf(stderr, "\nindex: %s\n", err.c_str());
+      return 1;
+    }
+    const IndexStats st = rt.codebase().stats();
+    std::printf("\r  %lld files, %lld chunks, %lld tokens in %.2f s scan + %.2f s embed"
+                "  (%s, %.1f MiB)%20s\n",
+                static_cast<long long>(st.files), static_cast<long long>(st.chunks),
+                static_cast<long long>(st.tokens), st.scan_seconds, st.embed_seconds,
+                st.embedder.c_str(), st.memory_bytes / (1024.0 * 1024.0), "");
+    for (const auto& l : st.by_language)
+      std::printf("    %-12s %lld chunks\n", l.first.c_str(),
+                  static_cast<long long>(l.second));
+  }
+
+  // Retrieval on its own, so the index can be inspected without a model in the
+  // way: this is how you tell "the model is weak" apart from "retrieval missed".
+  if (a.has("search") || a.has("symbol") || a.flag("overview")) {
+    if (rt.codebase().empty()) {
+      std::fprintf(stderr, "no index - pass --index DIR first\n");
+      return 1;
+    }
+    if (a.flag("overview")) std::printf("%s\n", rt.codebase().overview(4000).c_str());
+    const bool sym = a.has("symbol");
+    if (sym || a.has("search")) {
+      const std::string q = sym ? a.str("symbol") : a.str("search");
+      const size_t k = static_cast<size_t>(a.integer("k", 5));
+      const std::vector<SearchHit> hits =
+          sym ? rt.codebase().find_symbol(q, k) : rt.codebase().search(q, k);
+      std::printf("\n%s \"%s\": %zu hits\n", sym ? "find_symbol" : "search",
+                  q.c_str(), hits.size());
+      for (size_t i = 0; i < hits.size(); ++i) {
+        const CodeChunk* c = rt.codebase().chunk(hits[i].chunk);
+        if (!c) continue;
+        std::printf("  %zu. %-52s score %.3f  bm25 %.2f  cos %.3f  [%s]\n", i + 1,
+                    c->header().c_str(), hits[i].score, hits[i].bm25, hits[i].dense,
+                    hits[i].why.c_str());
+      }
+    }
+    if (!a.has("ask") && a.positional().empty()) return 0;
+  }
+
+  AskRequest req;
+  const std::string mode = a.str("mode", "fast");
+  if (mode == "strong" || mode == "olmo") req.mode = AskMode::kStrong;
+  else if (mode == "debate" || mode == "both") req.mode = AskMode::kDebate;
+  else if (mode == "self" || mode == "self-debate") req.mode = AskMode::kSelfDebate;
+  else req.mode = AskMode::kFast;
+  req.fast_multiplier = static_cast<int>(a.integer("fast-mult", 2));
+  req.strong_multiplier = static_cast<int>(a.integer("strong-mult", 1));
+  req.voices = static_cast<int>(a.integer("voices", 2));
+  req.use_tools = !a.flag("no-tools");
+  req.use_codebase = !a.flag("no-codebase");
+  req.max_tool_steps = static_cast<int>(a.integer("tool-steps", 3));
+  req.max_tokens = static_cast<int>(a.integer("max-new", 320));
+  req.seed = static_cast<uint64_t>(a.integer("seed", 0));
+  if (a.has("system")) req.system_prompt = a.str("system");
+
+  std::printf("\nmode: %s\n", ask_mode_name(req.mode));
+  for (const std::string& l : rt.status_lines()) std::printf("  %s\n", l.c_str());
+  std::printf("  tools: ");
+  for (const ToolSpec& s : rt.tools().specs()) std::printf("%s ", s.name.c_str());
+  std::printf("\n");
+
+  auto run_one = [&](const std::string& question) {
+    req.question = question;
+    std::atomic<bool> cancel{false};
+    AskObserver obs;
+    if (!a.flag("quiet") && !(req.mode == AskMode::kDebate ||
+                              req.mode == AskMode::kSelfDebate)) {
+      obs.on_text = [](const std::string& piece) {
+        std::printf("%s", piece.c_str());
+        std::fflush(stdout);
+      };
+    }
+    obs.on_tool = [](const ToolTrace& t) {
+      std::printf("\n  [tool %s %s -> %s in %.2fs]\n", t.tool.c_str(), t.args.c_str(),
+                  t.denied ? "denied" : (t.ok ? "ok" : "failed"), t.seconds);
+    };
+    int last_round = -1;
+    if (req.mode == AskMode::kDebate || req.mode == AskMode::kSelfDebate) {
+      obs.on_debate = [&](const DebateTranscript& tr) {
+        if (static_cast<int>(tr.rounds.size()) == last_round) return;
+        last_round = static_cast<int>(tr.rounds.size());
+        if (tr.rounds.empty()) return;
+        const DebateRound& r = tr.rounds.back();
+        std::printf("  [%3.0f%%] round %d (%s): %zu answers in %.2fs\n",
+                    100.0 * tr.progress, r.index, r.kind.c_str(), r.answers.size(),
+                    r.seconds);
+      };
+    }
+    const AskResult res = rt.ask(req, &cancel, obs);
+    if (!res.error.empty()) {
+      std::fprintf(stderr, "\nerror: %s\n", res.error.c_str());
+      return;
+    }
+    if (res.was_debate && a.flag("transcript")) {
+      std::printf("\n--- transcript ---\n");
+      for (const DebateRound& r : res.debate.rounds) {
+        std::printf("\n[round %d %s]%s\n", r.index, r.kind.c_str(),
+                    r.note.empty() ? "" : ("  " + r.note).c_str());
+        for (const DebateAnswer& ans : r.answers) {
+          std::printf("  %s#%d  score %.3f (agree %.2f, judge %.1f/10, %d tok, "
+                      "%d reused, %.2fs)\n",
+                      ans.participant.c_str(), ans.draft, ans.score, ans.cluster_mass,
+                      ans.judge_score, ans.gen_tokens, ans.reused_tokens, ans.seconds);
+          if (!ans.critique.empty())
+            std::printf("    critique: %s\n", utf8_truncate(ans.critique, 300).c_str());
+          std::printf("    %s\n", utf8_truncate(ans.text, 400).c_str());
+        }
+      }
+      std::printf("\n%s", res.debate.decision_log.c_str());
+      for (const DebateTranscript::Usage& u : res.debate.usage)
+        std::printf("  usage %-8s %d calls, %d prompt (%d reused), %d generated, %.2fs\n",
+                    u.backend_id.c_str(), u.calls, u.prompt_tokens, u.reused_tokens,
+                    u.gen_tokens, u.seconds);
+    }
+    if (res.was_debate) std::printf("\n--- answer ---\n%s\n", res.answer.c_str());
+    else std::printf("\n");
+    std::printf("\n[%.2fs, %d prompt tokens (%d reused from cache), %d generated%s]\n",
+                res.seconds, res.prompt_tokens, res.reused_tokens, res.gen_tokens,
+                res.was_debate ? (res.debate.escalated ? ", escalated"
+                                                       : ", cheap path only")
+                               : "");
+    if (!res.tools.empty()) {
+      std::printf("tools used:");
+      for (const ToolTrace& t : res.tools) std::printf(" %s", t.tool.c_str());
+      std::printf("\n");
+    }
+  };
+
+  if (a.has("ask")) {
+    run_one(a.str("ask"));
+    return 0;
+  }
+  if (!a.positional().empty()) {
+    std::string q;
+    for (const std::string& w : a.positional()) q += (q.empty() ? "" : " ") + w;
+    run_one(q);
+    return 0;
+  }
+  std::printf("\ninteractive - empty line quits\n");
+  std::string line;
+  while (true) {
+    std::printf("\n> ");
+    std::fflush(stdout);
+    if (!std::getline(std::cin, line) || line.empty()) break;
+    run_one(line);
+  }
+  return 0;
+}
+
 // -------------------------------------------------------------------- memory
 int cmd_memory(const Args& a) {
   MemoryStore mem;
@@ -1615,6 +1899,8 @@ int main(int argc, char** argv) {
   const std::string cmd = argv[1];
   Args a(argc - 2, argv + 2);
   try {
+    if (cmd == "up") return cmd_up(a);
+    if (cmd == "agent") return cmd_agent(a);
     if (cmd == "info") return cmd_info(a);
     if (cmd == "tokenizer") return cmd_tokenizer(a);
     if (cmd == "pretrain") return cmd_pretrain(a);

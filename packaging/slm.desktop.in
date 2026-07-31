@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SLM / SPT dashboard
+Comment=Small language model with live self-training, dual-model debate and agent tools
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/slm up
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Development;Science;
+Keywords=llm;ai;training;persian;

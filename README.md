@@ -19,6 +19,42 @@
 
 ---
 
+## شروع سریع: یک کامند
+
+```bash
+git clone https://github.com/Im-Saleh/My-LLM && cd My-LLM
+./build.sh                 # بیلد
+./build/slm up             # همین. مدل را خودش پیدا می‌کند و داشبورد باز می‌شود.
+```
+
+`slm up` هیچ آرگومانی لازم ندارد: مدل `spt` را در `./models`، `~/.local/share/slm`،
+`/usr/share/slm/models` و کنار خود باینری می‌گردد، و اگر پیدا نکرد **خودش یک مدل
+شروع می‌سازد** تا داشبورد همیشه باز شود. با `slm up --where` می‌بینید کجاها را گشته.
+اگر display نباشد خودکار به داشبورد ترمینال برمی‌گردد.
+
+یک مدل وجود دارد و اسمش **SPT** است: `models/spt.slm` + `models/spt.slmtok`
+(+ `models/spt-q4.slmq` برای اجرای int4).
+
+### عامل دو-مدلی و مناظره
+
+```bash
+# فقط SPT (سریع)
+slm agent --ask "..."
+
+# با OLMo 3 7B هم:
+slm agent --gguf ~/models/Olmo-3-7B-Instruct-Q4_K_M.gguf --mode debate \
+          --fast-mult 2 --strong-mult 1 --ask "..." --transcript
+
+# مناظره‌ی یک مدل با خودش (چند صدا، KV cache و persona جدا)
+slm agent --mode self --voices 3 --ask "..."
+
+# ایندکس کدبیس و پرسش درباره‌اش
+slm agent --index . --ask "کجای کد تصمیم می‌گیرد آپدیت پذیرفته شود؟"
+slm agent --index . --symbol qpack_synthesise      # فقط بازیابی، بدون مدل
+```
+
+جزئیات: [`docs/AGENT.fa.md`](docs/AGENT.fa.md)
+
 ## نصب و اجرا
 
 ```bash
@@ -144,6 +180,7 @@ unzip libtorch-*.zip -d /opt && ./build.sh --libtorch /opt/libtorch --no-gui
 | [`docs/MULTILINGUAL.fa.md`](docs/MULTILINGUAL.fa.md) | **استراتژی توکنایزر، ترکیب دیتاست با درصد، پلن آموزش مرحله‌ای، ارزیابی** + منابع فارسی/کد |
 | [`docs/COORDINATOR.fa.md`](docs/COORDINATOR.fa.md) | توضیح فنی دقیق coordinator و ترکیب سه منبع آپدیت |
 | [`docs/ARCHITECTURE.fa.md`](docs/ARCHITECTURE.fa.md) | نمای کلی معماری، نمودار، همزمانی، بودجه‌ی حافظه |
+| [`docs/AGENT.fa.md`](docs/AGENT.fa.md) | **عامل دو-مدلی، مناظره‌ی وزن‌دار، ابزارها و RAG کدبیس** |
 | [`docs/QUANTIZATION.fa.md`](docs/QUANTIZATION.fa.md) | **int4/int8 + mmap: اجرای مدل ۲ میلیارد پارامتری** روی همین سخت‌افزار |
 | [`docs/SCALING.fa.md`](docs/SCALING.fa.md) | **۷ تریلیون پارامتر: اعداد واقعی** و نردبان اندازه‌های عملی |
 | [`docs/TEACHING.fa.md`](docs/TEACHING.fa.md) | **چطور به مدل چیز یاد بدهم** — چهار سطح یادگیری، از حافظه تا fine-tune |
@@ -366,7 +403,10 @@ slm qbench      --model F.slmq [--gen N] [--cold]        توان عبوری + �
 slm qeval       --model F.slmq --data F [--ckpt F.slm]   کیفیت کوانتیزه در برابر f32
 slm bench       [--config F] [--batch N]                 توان عبوری
 slm live        / slm dashboard                          سیستم کامل + داشبورد
-slm_gradcheck   / slm_texttest / slm_qtest                تست‌ها
+slm up          <- شروع اینجا: پیدا/ساخت مدل + داشبورد، بدون آرگومان
+slm agent       --ask S [--mode fast|strong|debate|self] [--gguf F] [--index D]
+slm_gradcheck / slm_texttest / slm_qtest / slm_agenttest
+slm_codebasetest / slm_debatetest                        ۳۷۰ بررسی
 ```
 
 هر کلید کانفیگ از خط فرمان هم قابل تنظیم است: `--set coord.ties_keep=0.2`.
