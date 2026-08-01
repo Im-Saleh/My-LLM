@@ -9,6 +9,7 @@
 #   ./install.sh                    system wide (/usr/local, uses sudo if needed)
 #   ./install.sh --prefix ~/.local  no root required
 #   ./install.sh --with-olmo        also download OLMo 3 7B (4.5 GB)
+#   ./install.sh --olmo FILE.gguf  use a GGUF you already have (no download)
 #   ./install.sh --no-llama         skip llama.cpp (then only SPT works)
 #   ./install.sh --deps             install the build dependencies first
 set -euo pipefail
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix) PREFIX="${2:?}"; shift 2 ;;
     --with-olmo) WITH_OLMO=1; shift ;;
+    --olmo) WITH_OLMO=1; OLMO_GGUF="$2"; shift 2 ;;
     --no-llama) WITH_LLAMA=0; shift ;;
     --deps) DO_DEPS=1; shift ;;
     --jobs|-j) JOBS="${2:?}"; shift 2 ;;
@@ -154,15 +156,37 @@ if [[ $WITH_OLMO == 1 ]]; then
   # the directory we would download into: a 4.5 GB re-download because the file
   # sits one directory over is unacceptable.
   EXISTING=""
+  is_gguf() {  # over 1 GB and starting with the GGUF magic
+    [[ -f "$1" ]] && [[ "$(stat -c%s "$1" 2>/dev/null || echo 0)" -gt 1000000000 ]] &&
+      [[ "$(head -c4 "$1" 2>/dev/null)" == "GGUF" ]]
+  }
+  # 1. An explicit answer always wins.
+  if [[ -n "${OLMO_GGUF:-}" ]]; then
+    if is_gguf "$OLMO_GGUF"; then
+      EXISTING="$OLMO_GGUF"
+    else
+      warn "OLMO_GGUF=$OLMO_GGUF is not a GGUF file over 1 GB - ignoring it"
+    fi
+  fi
+  # 2. Otherwise ask the binary we just installed.  It searches more places than
+  #    any list here can predict (SLM_HOME, XDG dirs, next to the executable),
+  #    so its answer is the authoritative one - and a 4.5 GB re-download because
+  #    the file sits in a directory this script forgot is unacceptable.
+  if [[ -z $EXISTING ]] && FOUND=$("$PREFIX/bin/slm" --gguf-path 2>/dev/null); then
+    is_gguf "$FOUND" && EXISTING="$FOUND"
+  fi
+  # 3. Belt and braces: scan the usual directories too.
   for d in "$OLMO_DIR" "$MODELDIR" \
+           "${SLM_HOME:-}" "${SLM_HOME:-}/models" \
            "${XDG_DATA_HOME:-$HOME/.local/share}/slm/models" \
            "${XDG_DATA_HOME:-$HOME/.local/share}/slm" \
            /usr/share/slm/models /usr/local/share/slm/models \
            "$HOME/models" "$ROOT/models"; do
+    [[ -n $EXISTING ]] && break
+    [[ -n "$d" ]] || continue
     [[ -d "$d" ]] || continue
     while IFS= read -r -d '' f; do
-      # Anything over 1 GB starting with the GGUF magic is a real model file.
-      if [[ "$(stat -c%s "$f")" -gt 1000000000 ]] && [[ "$(head -c4 "$f")" == "GGUF" ]]; then
+      if is_gguf "$f"; then
         EXISTING="$f"
         break 2
       fi
