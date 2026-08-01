@@ -143,6 +143,9 @@ struct DebateAnswer {
   int gen_tokens = 0;
   int reused_tokens = 0;
   bool superseded = false;      // revised in a later round
+  bool carried = false;         // brought forward unchanged: this round gave the
+                                // participant nothing worth reacting to, so it
+                                // stays in the running without spending tokens
 };
 
 struct DebateRound {

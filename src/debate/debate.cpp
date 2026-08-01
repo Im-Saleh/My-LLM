@@ -596,13 +596,20 @@ DebateTranscript DebateEngine::run(const std::string& question,
       }
     }
 
+    // Agreement only means something when there is somebody to agree with.  With
+    // a single answer the cluster trivially holds all the weight, so the term
+    // reads 1.00 - the maximum - and that round then outscores any genuinely
+    // contested round no matter how good its answers were.  Scores have to be
+    // comparable across rounds, because the winner is picked across all of them.
+    const bool contested = round->answers.size() > 1;
     for (size_t i = 0; i < round->answers.size(); ++i) {
       DebateAnswer& a = round->answers[i];
       a.cluster = cl[i];
       a.cluster_mass = mass[cl[i]] / total_w;
+      const double agreement = contested ? a.cluster_mass : 0.5;  // neutral prior
       const double judge = a.judge_votes ? a.judge_score / 10.0 : 0.5;
       const double flu = normalise_fluency(a.fluency, lo, hi);
-      a.score = cfg.w_agreement * a.cluster_mass + cfg.w_judge * judge +
+      a.score = cfg.w_agreement * agreement + cfg.w_judge * judge +
                 cfg.w_fluency * flu;
     }
     std::sort(round->answers.begin(), round->answers.end(),
@@ -699,7 +706,32 @@ DebateTranscript DebateEngine::run(const std::string& question,
           own = x.text;
           break;
         }
-      if (peers.empty()) continue;
+      if (peers.empty()) {
+        // Nothing worth reacting to, so there is nothing to generate - but this
+        // actor must still be *represented* in the round.  Dropping it silently
+        // is how a strong model disappeared from a debate it was winning: with
+        // only the weak actor left, its lone answer scored agreement 1.00 (it was
+        // the whole round) and beat its own much better draft from round 0.  So
+        // carry the previous answer forward unchanged, at no token cost.
+        if (!own.empty()) {
+          DebateAnswer keep;
+          for (const DebateAnswer& x : prev.answers)
+            if (x.participant == a.spec.name) {
+              keep = x;
+              break;
+            }
+          keep.round = r;
+          keep.critique.clear();
+          keep.seconds = 0.0;
+          keep.gen_tokens = 0;
+          keep.reused_tokens = 0;
+          keep.judge_score = 0.0;
+          keep.judge_votes = 0;
+          keep.carried = true;
+          round.answers.push_back(keep);
+        }
+        continue;
+      }
 
       std::string ask = ctx_block + "Question: " + question + "\n\n";
       if (!own.empty())
