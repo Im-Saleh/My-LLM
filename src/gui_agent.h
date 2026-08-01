@@ -30,6 +30,8 @@ struct AgentTurn {
   DebateTranscript debate;
   std::vector<ToolTrace> tools;
   std::string context_used;
+  std::string thinking;
+  std::vector<std::string> sources;
   double seconds = 0.0;
   int prompt_tokens = 0, gen_tokens = 0, reused_tokens = 0;
   bool was_debate = false;
@@ -40,6 +42,13 @@ struct AgentSnapshot {
   bool busy = false;
   std::string question;         // the one in flight
   std::string partial;          // streamed text so far
+  // What the agent is doing this instant ("searching the web: ...", "reading
+  // src/qmodel.cpp:417-445").  Without this the UI looks frozen for the tens of
+  // seconds a 7B model needs, and there is no way to tell whether a web search
+  // happened at all.  Distinct from `status`, which is the per-backend summary.
+  std::string doing;
+  std::vector<std::string> activity;   // the last few `doing` values, in order
+  std::vector<ToolTrace> live_tools;   // tools finished during this turn
   double progress = 0.0;        // debate progress, 0..1
   DebateTranscript live;        // the debate as it stands
   std::vector<AgentTurn> history;

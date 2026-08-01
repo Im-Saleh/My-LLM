@@ -1570,9 +1570,16 @@ int cmd_agent(const Args& a) {
         std::fflush(stdout);
       };
     }
+    obs.on_status = [](const std::string& what) {
+      std::printf("  * %s\n", what.c_str());
+      std::fflush(stdout);
+    };
     obs.on_tool = [](const ToolTrace& t) {
-      std::printf("\n  [tool %s %s -> %s in %.2fs]\n", t.tool.c_str(), t.args.c_str(),
-                  t.denied ? "denied" : (t.ok ? "ok" : "failed"), t.seconds);
+      std::printf("    %s %s (%.2fs)\n", t.denied ? "denied:" : (t.ok ? "ok:" : "failed:"),
+                  t.detail.empty() ? t.tool.c_str() : t.detail.c_str(), t.seconds);
+      for (const std::string& src : t.sources)
+        std::printf("      - %s\n", utf8_truncate(src, 100).c_str());
+      std::fflush(stdout);
     };
     int last_round = -1;
     if (req.mode == AskMode::kDebate || req.mode == AskMode::kSelfDebate) {
@@ -1619,11 +1626,13 @@ int cmd_agent(const Args& a) {
                 res.was_debate ? (res.debate.escalated ? ", escalated"
                                                        : ", cheap path only")
                                : "");
-    if (!res.tools.empty()) {
-      std::printf("tools used:");
-      for (const ToolTrace& t : res.tools) std::printf(" %s", t.tool.c_str());
-      std::printf("\n");
+    if (!res.sources.empty()) {
+      std::printf("sources:\n");
+      for (const std::string& src : res.sources)
+        std::printf("  - %s\n", utf8_truncate(src, 110).c_str());
     }
+    if (a.flag("thinking") && !res.thinking.empty())
+      std::printf("thinking:\n%s", res.thinking.c_str());
   };
 
   if (a.has("ask")) {
@@ -2104,6 +2113,12 @@ int main(int argc, char** argv) {
     }
     if (cmd == "-h" || cmd == "--help" || cmd == "help") {
       print_usage();
+      return 0;
+    }
+    if (cmd == "--gguf-path") {
+      const std::string g = find_gguf();
+      if (g.empty()) return 1;
+      std::printf("%s\n", g.c_str());
       return 0;
     }
     if (cmd == "--version" || cmd == "-V" || cmd == "version") {

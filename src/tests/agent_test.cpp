@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "agent/http.h"
+#include "agent/runtime.h"
 #include "agent/tools.h"
 #include "core/text.h"
 #include "telemetry.h"
@@ -595,6 +596,64 @@ void test_urls() {
   check(HttpClient::host_of("not a url").empty(), "host_of on nonsense is empty");
 }
 
+// The router decides what the agent does before it thinks, so a wrong decision
+// costs a whole retrieval and shows the user the wrong activity.  These are the
+// cases that were actually wrong in practice.
+void test_router() {
+  std::printf("[9] the deterministic tool router\n");
+
+  // Regression: kHints matched as substrings, so "latest" contains "test" and
+  // every question about a current version was answered from the code index.
+  {
+    const ToolPlan p = plan_tools("what is the latest release of CMake?", true, true);
+    check(!p.codebase, "'latest' no longer matches the 'test' code hint");
+    check(p.search, "a question about the latest release triggers a web search");
+  }
+  // ...while a real code question still routes to the index and not the web.
+  {
+    const ToolPlan p = plan_tools("where is the debate winner chosen in this project?",
+                                  true, true);
+    check(p.codebase, "a question about the project reaches the codebase");
+    check(!p.search, "a code question does not also hit the network");
+  }
+  {
+    const ToolPlan p = plan_tools("تابع tokenize کجاست؟", true, true);
+    check(p.codebase, "Persian code questions route to the codebase");
+  }
+  {
+    const ToolPlan p = plan_tools("آخرین نسخه پایتون چیست؟", false, true);
+    check(p.search, "Persian questions about the newest version search the web");
+  }
+  // An explicit link is fetched directly - searching for it would be a detour.
+  {
+    const ToolPlan p =
+        plan_tools("summarise https://cmake.org/download/ for me", false, true);
+    check(p.fetch && p.url == "https://cmake.org/download/",
+          "an explicit URL is fetched, not searched");
+    check(!p.search, "an explicit URL suppresses the search");
+  }
+  {
+    const ToolPlan p = plan_tools("read https://example.org/a. Then explain.", false, true);
+    check(p.url == "https://example.org/a",
+          "trailing sentence punctuation is not part of the URL", p.url);
+  }
+  // Capabilities that are switched off must not be planned for, whatever the
+  // question looks like: this is what "disable the web" has to mean.
+  {
+    const ToolPlan p = plan_tools("what is the latest release of CMake?", true, false);
+    check(!p.search && !p.fetch, "web off means no web step is planned");
+  }
+  {
+    const ToolPlan p = plan_tools("where is the tokenizer class defined?", false, true);
+    check(!p.codebase, "no index means no codebase step is planned");
+  }
+  {
+    const ToolPlan p = plan_tools("سلام، حالت چطور است؟", true, true);
+    check(!p.search && !p.codebase && !p.fetch,
+          "small talk needs no tools at all");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -610,6 +669,7 @@ int main() {
   test_summarise();
   test_ranking();
   test_urls();
+  test_router();
   std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

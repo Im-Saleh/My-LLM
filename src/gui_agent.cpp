@@ -87,6 +87,9 @@ void AgentController::ask(const std::string& question, AskMode mode, int fast_mu
     p_->snap.partial.clear();
     p_->snap.progress = 0.0;
     p_->snap.live = DebateTranscript();
+    p_->snap.doing = "starting";
+    p_->snap.activity.clear();
+    p_->snap.live_tools.clear();
   }
   AskRequest req;
   req.question = question;
@@ -109,10 +112,17 @@ void AgentController::ask(const std::string& question, AskMode mode, int fast_mu
       p_->snap.live = tr;
       p_->snap.progress = tr.progress;
     };
+    obs.on_status = [this](const std::string& what) {
+      std::lock_guard<std::mutex> g(p_->m);
+      p_->snap.doing = what;
+      p_->snap.activity.push_back(what);
+      // Only the recent history is interesting; a long retrieval would otherwise
+      // push the answer off the screen.
+      while (p_->snap.activity.size() > 12) p_->snap.activity.erase(p_->snap.activity.begin());
+    };
     obs.on_tool = [this](const ToolTrace& t) {
       std::lock_guard<std::mutex> g(p_->m);
-      p_->snap.partial += "\n[tool " + t.tool + ": " +
-                          (t.denied ? "denied" : (t.ok ? "ok" : "failed")) + "]\n";
+      p_->snap.live_tools.push_back(t);
     };
     const AskResult res = p_->rt->ask(req, &p_->cancel, obs);
     AgentTurn turn;
@@ -122,6 +132,8 @@ void AgentController::ask(const std::string& question, AskMode mode, int fast_mu
     turn.debate = res.debate;
     turn.tools = res.tools;
     turn.context_used = res.context_used;
+    turn.thinking = res.thinking;
+    turn.sources = res.sources;
     turn.seconds = res.seconds;
     turn.prompt_tokens = res.prompt_tokens;
     turn.gen_tokens = res.gen_tokens;
@@ -134,6 +146,9 @@ void AgentController::ask(const std::string& question, AskMode mode, int fast_mu
       while (p_->snap.history.size() > 40) p_->snap.history.erase(p_->snap.history.begin());
       p_->snap.partial.clear();
       p_->snap.question.clear();
+      p_->snap.doing.clear();
+      p_->snap.activity.clear();
+      p_->snap.live_tools.clear();
       p_->snap.progress = res.was_debate ? 1.0 : 0.0;
       p_->snap.status = p_->rt->status_lines();
     }

@@ -42,6 +42,26 @@ enum class AskMode {
 };
 const char* ask_mode_name(AskMode m);
 
+// ------------------------------------------------------------ the tool router
+// Whether a question needs something the weights cannot contain.
+//
+// This is deterministic and lives outside the model because asking the model to
+// emit tool-call syntax does not work at these sizes: SPT-30M never produces a
+// well-formed call, and OLMo sometimes writes plausible *fake* search results
+// inside the call block instead of making it.  The decision is taken here from
+// the question, and the tool then runs whether or not the model would have asked.
+//
+// Public because it decides what the agent does before it thinks, which makes it
+// the part most worth testing directly.
+struct ToolPlan {
+  bool search = false;     // run a web search
+  bool fetch = false;      // fetch `url` directly
+  std::string url;         // explicit URL found in the question
+  bool codebase = false;   // retrieve from the indexed repository
+  std::string reason;      // shown in the UI under "thinking"
+};
+ToolPlan plan_tools(const std::string& question, bool have_index, bool web_ok);
+
 struct AgentRuntimeOptions {
   // SPT: exactly one of these three.
   std::string spt_ckpt;                 // .slm
@@ -77,6 +97,11 @@ struct AskRequest {
   int voices = 2;                       // kSelfDebate
   bool use_tools = true;
   bool use_codebase = true;             // inject retrieved context automatically
+  // Run the retrieval tools from a deterministic plan instead of waiting for the
+  // model to emit tool-call syntax.  A 32M model never emits it correctly and a
+  // 7B model sometimes hallucinates the *results* instead of the call, so on by
+  // default: it is the only way tools work with a small model.
+  bool auto_tools = true;
   int max_tool_steps = 4;
   int max_tokens = 320;
   uint64_t seed = 0;
@@ -90,11 +115,18 @@ struct ToolTrace {
   bool denied = false;
   double seconds = 0.0;
   std::string output;   // truncated for display
+  // What actually happened, in one human sentence: the query that was searched,
+  // the host that was read, the files that were retrieved.  The GUI shows this;
+  // "web_search query=..." is not what someone wants to read.
+  std::string detail;
+  std::vector<std::string> sources;   // URLs or file paths this call used
 };
 
 struct AskResult {
   std::string answer;
   std::string context_used;             // what retrieval injected, for inspection
+  std::string thinking;                 // reasoning/critique, collapsed in the UI
+  std::vector<std::string> sources;     // every URL and file the answer rests on
   std::vector<ToolTrace> tools;
   DebateTranscript debate;              // populated in the two debate modes
   bool was_debate = false;
@@ -109,6 +141,9 @@ struct AskObserver {
   std::function<void(const std::string& piece)> on_text;
   std::function<void(const DebateTranscript&)> on_debate;
   std::function<void(const ToolTrace&)> on_tool;
+  // Live "what am I doing right now", e.g. "searching the web: cmake latest
+  // version" or "reading src/qmodel.cpp:417-445".  Called from the worker thread.
+  std::function<void(const std::string& status)> on_status;
 };
 
 class AgentRuntime {

@@ -982,9 +982,14 @@ void muted(const char* fmt, ...) {
 
 // A card: a titled child window with padding.  Returns false when collapsed
 // (never, currently) so call sites read like a scope.
-bool begin_card(const char* id, const ImVec2& size, const char* title = nullptr) {
+// `flags` exists for the fixed-height cards: a card one pixel shorter than its
+// contents grows a scrollbar, and a 6px scrollbar inside a 74px card is the kind
+// of detail that makes a UI look broken.  Cards that are *meant* to scroll (the
+// transcript, the log) pass nothing and keep the default behaviour.
+bool begin_card(const char* id, const ImVec2& size, const char* title = nullptr,
+                ImGuiWindowFlags flags = 0) {
   ImGui::PushStyleColor(ImGuiCol_ChildBg, kSurface);
-  ImGui::BeginChild(id, size, ImGuiChildFlags_Border);
+  ImGui::BeginChild(id, size, ImGuiChildFlags_Border, flags);
   ImGui::PopStyleColor();
   if (title) {
     ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
@@ -1020,7 +1025,16 @@ const NavItem kNav[] = {
 void sidebar_model_card(DashboardContext& ctx, const BackendPtr& b) {
   const BackendStatus s = b->status();
   ImGui::PushID(b->id().c_str());
-  theme::begin_card((b->id() + "_card").c_str(), ImVec2(-1, 74));
+  // Sized from the font rather than hard-coded: 74px happened to fit an 18.5px
+  // font and clipped a 19px one.
+  // loaded:      name / params+size / tok-s
+  // not loaded:  name / "not loaded" / [load]
+  const float rows = 2.0f * ImGui::GetTextLineHeightWithSpacing() +
+                     (s.loaded ? ImGui::GetTextLineHeightWithSpacing()
+                               : ImGui::GetFrameHeight()) +
+                     2.0f * ImGui::GetStyle().WindowPadding.y;
+  theme::begin_card((b->id() + "_card").c_str(), ImVec2(-1, rows), nullptr,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
   ImGui::PushStyleColor(ImGuiCol_Text, s.loaded ? theme::kModel : theme::kTextDim);
   ImGui::TextUnformatted(b->display_name().c_str());
   ImGui::PopStyleColor();
@@ -1076,12 +1090,41 @@ void sidebar(DashboardContext& ctx, View* view, double uptime) {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
+
+  // Everything from here to the stop button lives in its own scrolling region.
+  // Reserving space with a Dummy instead (the obvious way) silently pushes the
+  // stop and quit buttons off the bottom as soon as the status block grows -
+  // which is exactly what happened when the memory and codebase lines were
+  // added.  A child sized to "all but the bottom block" cannot do that.
+  const float bottom = 3.0f * ImGui::GetTextLineHeightWithSpacing() + 78.0f;
+  ImGui::BeginChild("sidebar_scroll", ImVec2(0, -bottom), ImGuiChildFlags_None);
   if (ctx.agent)
     for (const BackendPtr& b : ctx.agent->backends().all()) sidebar_model_card(ctx, b);
 
-  // Bottom block: the global stop and the session facts.
-  const float bottom = 132.0f;
-  ImGui::Dummy(ImVec2(1, std::max(0.0f, ImGui::GetContentRegionAvail().y - bottom)));
+  // Between the model cards and the stop button used to be dead space.  Put the
+  // numbers worth seeing without navigating anywhere there instead.
+  // One line each: a 228px sidebar has no room for headings above single values.
+  ImGui::Spacing();
+  if (ctx.agent) {
+    const size_t w = ctx.agent->backends().weight_bytes();
+    const size_t kv = ctx.agent->backends().kv_bytes();
+    if (w || kv) {
+      std::string m = "memory: " + human_bytes(static_cast<double>(w));
+      if (kv) m += " + " + human_bytes(static_cast<double>(kv)) + " KV";
+      theme::muted("%s", m.c_str());
+    }
+    if (ctx.agent->codebase().empty()) {
+      theme::muted("codebase: not indexed");
+    } else {
+      const IndexStats st = ctx.agent->codebase().stats();
+      theme::muted("codebase: %lld files / %lld chunks",
+                   static_cast<long long>(st.files), static_cast<long long>(st.chunks));
+    }
+  }
+  theme::muted("self-training: %s", ctx.tel->self_training_enabled() ? "on" : "off");
+  ImGui::EndChild();
+
+  // Bottom block: the global stop and the session facts.  Always visible.
   const bool stopped = ctx.tel->stopped();
   ImGui::PushStyleColor(ImGuiCol_Button,
                         stopped ? ImVec4(0.15f, 0.45f, 0.22f, 1.0f)
@@ -1100,6 +1143,44 @@ void sidebar(DashboardContext& ctx, View* view, double uptime) {
   ImGui::EndChild();
 }
 
+
+// A collapsed-by-default disclosure section.  Everything the model did to reach
+// an answer - retrieval, tool calls, critiques, debate rounds - lives behind one
+// of these, so the answer is what you read and the reasoning is what you open.
+bool disclosure(const char* id, const char* label, int count, bool default_open) {
+  ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+  ImGui::PushStyleColor(ImGuiCol_HeaderHovered, theme::kAccentDim);
+  ImGui::PushStyleColor(ImGuiCol_Text, theme::kTextDim);
+  ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_SpanAvailWidth;
+  if (default_open) f |= ImGuiTreeNodeFlags_DefaultOpen;
+  char title[128];
+  if (count > 0) std::snprintf(title, sizeof(title), "%s  (%d)", label, count);
+  else std::snprintf(title, sizeof(title), "%s", label);
+  const bool open = ImGui::TreeNodeEx(id, f, "%s", title);
+  ImGui::PopStyleColor(3);
+  return open;
+}
+
+// One tool call, rendered for a human: what it did and what it touched.
+void tool_line(const ToolTrace& t) {
+  const ImVec4 col = t.denied ? theme::kWarn : (t.ok ? theme::kGood : theme::kBad);
+  ImGui::PushStyleColor(ImGuiCol_Text, col);
+  ImGui::TextUnformatted(t.denied ? "denied" : (t.ok ? "done" : "failed"));
+  ImGui::PopStyleColor();
+  ImGui::SameLine();
+  const std::string what = t.detail.empty() ? (t.tool + " " + t.args) : t.detail;
+  ImGui::PushStyleColor(ImGuiCol_Text, theme::kText);
+  ImGui::TextWrapped("%s", what.c_str());
+  ImGui::PopStyleColor();
+  for (const std::string& src : t.sources) {
+    ImGui::Bullet();
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+    ImGui::TextWrapped("%s", utf8_truncate(src, 110).c_str());
+    ImGui::PopStyleColor();
+  }
+  ImGui::TextDisabled("   %.2fs", t.seconds);
+}
+
 // ==================================================================== chat view
 // The main event.  Everything the agent can do is reachable from here: the model
 // dropdown chooses SPT, OLMo or a debate, and the two toggles decide whether a
@@ -1112,8 +1193,11 @@ void chat_view(DashboardContext& ctx, AgentUi& ui) {
   }
   const AgentSnapshot snap = ctx.actrl->snapshot();
 
-  // ---- header: model + capabilities
-  theme::begin_card("chathdr", ImVec2(-1, 56));
+  // ---- header: model + capabilities.  One row of widgets, so height comes from
+  // the frame height rather than a constant that only fits one font size.
+  const float hdr_h = ImGui::GetFrameHeight() + 2.0f * ImGui::GetStyle().WindowPadding.y;
+  theme::begin_card("chathdr", ImVec2(-1, hdr_h), nullptr,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
   ImGui::AlignTextToFramePadding();
   theme::muted("model");
   ImGui::SameLine();
@@ -1168,30 +1252,81 @@ void chat_view(DashboardContext& ctx, AgentUi& ui) {
   for (size_t i = 0; i < snap.history.size(); ++i) {
     const AgentTurn& t = snap.history[i];
     ImGui::PushID(static_cast<int>(i));
+
+    // ---- the question
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kUser);
     ImGui::TextUnformatted("you");
     ImGui::PopStyleColor();
     ui_wrapped(t.question);
     ImGui::Spacing();
+
+    // ---- who answered
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kModel);
-    ImGui::TextUnformatted(t.was_debate ? "debate" : (t.mode == AskMode::kStrong ? "OLMo" : "SPT"));
+    ImGui::TextUnformatted(t.was_debate ? "SPT + OLMo"
+                                        : (t.mode == AskMode::kStrong ? "OLMo" : "SPT"));
     ImGui::PopStyleColor();
-    if (!t.tools.empty()) {
-      for (const ToolTrace& tt : t.tools) {
-        const ImVec4 col = tt.denied ? theme::kWarn : (tt.ok ? theme::kTextDim : theme::kBad);
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::Text("  %s %s  (%.2fs)%s", tt.tool.c_str(),
-                    utf8_truncate(tt.args, 60).c_str(), tt.seconds,
-                    tt.denied ? "  denied" : (tt.ok ? "" : "  failed"));
-        ImGui::PopStyleColor();
+
+    // ---- everything that is not the answer, collapsed by default
+    const int steps = static_cast<int>(t.tools.size()) +
+                      static_cast<int>(t.debate.rounds.size());
+    if (steps > 0 || !t.thinking.empty() || !t.context_used.empty()) {
+      if (disclosure("think", "thinking", steps, false)) {
+        if (!t.thinking.empty()) {
+          const ImVec4 dim = theme::kTextDim;
+          ui_wrapped(t.thinking, &dim);
+        }
+        for (const ToolTrace& tt : t.tools) tool_line(tt);
+        for (const DebateRound& r : t.debate.rounds) {
+          ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+          ImGui::Text("round %d - %s (%.1fs)", r.index, r.kind.c_str(), r.seconds);
+          ImGui::PopStyleColor();
+          for (const DebateAnswer& a : r.answers) {
+            ImGui::TextDisabled("  %s  score %.2f | agree %.0f%% | judge %.1f/10",
+                                a.participant.c_str(), a.score, 100.0 * a.cluster_mass,
+                                a.judge_score);
+            if (!a.critique.empty()) {
+              const ImVec4 amber = theme::kWarn;
+              ui_wrapped("    " + a.critique, &amber);
+            }
+            ui_wrapped("    " + utf8_truncate(a.text, 600));
+          }
+        }
+        if (!t.debate.decision_log.empty()) {
+          const ImVec4 dim = theme::kTextDim;
+          ui_wrapped(t.debate.decision_log, &dim);
+        }
+        if (!t.context_used.empty() &&
+            disclosure("ctx", "retrieved reference material",
+                       static_cast<int>(t.context_used.size() / 1000), false)) {
+          const ImVec4 dim = theme::kTextDim;
+          ui_wrapped(utf8_truncate(t.context_used, 6000), &dim);
+          ImGui::TreePop();
+        }
+        ImGui::TreePop();
       }
     }
+
+    // ---- the answer itself
     ui_wrapped(t.answer.empty() ? ("(" + t.error + ")") : t.answer);
+
+    // ---- what it rests on
+    if (!t.sources.empty()) {
+      if (disclosure("src", "sources", static_cast<int>(t.sources.size()), true)) {
+        for (const std::string& sc : t.sources) {
+          ImGui::Bullet();
+          ImGui::PushStyleColor(ImGuiCol_Text, theme::kAccent);
+          ImGui::TextWrapped("%s", utf8_truncate(sc, 120).c_str());
+          ImGui::PopStyleColor();
+        }
+        ImGui::TreePop();
+      }
+    }
+
     theme::muted("%.2fs  |  %d prompt (%d cached)  |  %d generated", t.seconds,
                  t.prompt_tokens, t.reused_tokens, t.gen_tokens);
-    // Ratings feed the feedback (DPO) thread, exactly as the old chat did.
+    // Ratings feed the feedback (DPO) thread.
     ImGui::SameLine();
-    if (ctx.chat) {
+    if (ctx.hub) {
       for (int sc = 1; sc <= 5; ++sc) {
         char b[8];
         std::snprintf(b, sizeof(b), "%d", sc);
@@ -1219,15 +1354,29 @@ void chat_view(DashboardContext& ctx, AgentUi& ui) {
     ImGui::PopStyleColor();
     ui_wrapped(snap.question);
     ImGui::Spacing();
+
+    // A spinner plus the current action, so a 60-second OLMo turn does not look
+    // like a hang and a web search is visible as it happens.
+    const char* kSpin = "|/-\\";
+    const int frame = static_cast<int>(ImGui::GetTime() * 8.0) & 3;
     ImGui::PushStyleColor(ImGuiCol_Text, theme::kWarn);
-    ImGui::TextUnformatted(snap.progress > 0.0 ? "debating..." : "thinking...");
+    ImGui::Text("%c  %s", kSpin[frame],
+                snap.doing.empty() ? "working" : snap.doing.c_str());
     ImGui::PopStyleColor();
-    if (snap.progress > 0.0) {
+    if (snap.progress > 0.0)
       ImGui::ProgressBar(static_cast<float>(snap.progress), ImVec2(-1, 6), "");
-      if (!snap.live.rounds.empty()) {
-        const DebateRound& r = snap.live.rounds.back();
-        theme::muted("round %d (%s), %zu answers", r.index, r.kind.c_str(),
-                     r.answers.size());
+
+    if (!snap.activity.empty() || !snap.live_tools.empty()) {
+      if (disclosure("live", "steps so far",
+                     static_cast<int>(snap.activity.size()), true)) {
+        for (const std::string& act : snap.activity) {
+          ImGui::Bullet();
+          ImGui::PushStyleColor(ImGuiCol_Text, theme::kTextDim);
+          ImGui::TextWrapped("%s", act.c_str());
+          ImGui::PopStyleColor();
+        }
+        for (const ToolTrace& tt : snap.live_tools) tool_line(tt);
+        ImGui::TreePop();
       }
     }
     if (!snap.partial.empty()) {
@@ -1239,11 +1388,15 @@ void chat_view(DashboardContext& ctx, AgentUi& ui) {
     const ImVec4 dim = theme::kTextDim;
     theme::muted("Ask anything - Persian, English or Python.");
     ImGui::Spacing();
+    theme::muted("try:");
+    ImGui::Indent(14.0f);
     ui_wrapped("۲۳۴ ضربدر ۵۶ چند است؟", &dim);
     ui_wrapped("این پروژه چه کاری انجام می‌دهد؟", &dim);
-    theme::muted("        (needs an indexed folder)");
-    theme::muted("latest release of CMake?");
-    theme::muted("        (needs web enabled)");
+    theme::muted("what is the latest release of CMake?");
+    ImGui::Unindent(14.0f);
+    ImGui::Spacing();
+    theme::muted("Web search and codebase lookup start on their own when a");
+    theme::muted("question needs them; every source is listed under the answer.");
   }
   if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.0f) ImGui::SetScrollHereY(1.0f);
   theme::end_card();
@@ -1435,7 +1588,20 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  GLFWwindow* win = glfwCreateWindow(1600, 950, "slm - hybrid self-training monitor",
+  // A hard-coded size leaves black bands on a large screen and spills off a small
+  // one.  Fit the monitor's *work* area so panels and docks stay visible.
+  int win_w = 1600, win_h = 950;
+  if (GLFWmonitor* mon = glfwGetPrimaryMonitor()) {
+    int mx = 0, my = 0, mw = 0, mh = 0;
+    glfwGetMonitorWorkarea(mon, &mx, &my, &mw, &mh);
+    if (mw > 640 && mh > 480) {
+      // The *work* area already excludes taskbars and docks, so it can be used
+      // whole; only the window decoration needs allowing for.
+      win_w = mw;
+      win_h = mh - 32;
+    }
+  }
+  GLFWwindow* win = glfwCreateWindow(win_w, win_h, "SPT - self-improving assistant",
                                      nullptr, nullptr);
   if (!win) {
     std::fprintf(stderr, "cannot create a window, falling back to the terminal dashboard\n");
@@ -1454,15 +1620,58 @@ int run_imgui_dashboard(DashboardContext& ctx) {
   ImGui_ImplGlfw_InitForOpenGL(win, true);
   ImGui_ImplOpenGL3_Init("#version 150");
 
-  // Best effort: use a system font with wider glyph coverage when one exists.
+  // A real UI font, or the whole thing looks like a debug overlay: ImGui's
+  // built-in face is a 13px bitmap, and falling back to it is the single biggest
+  // reason a dashboard looks dated.  So try hard before giving up.
+  //
   // NOTE: the path *must* be checked first - ImGui 1.91 raises an internal
   // error (and crashes outside of a frame) when the file cannot be opened.
-  for (const char* path : {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                           "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
-                           "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                           "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf"}) {
-    if (!std::filesystem::exists(path)) continue;
-    if (io.Fonts->AddFontFromFileTTF(path, 18.5f)) break;
+  {
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;  // crisper stems at UI sizes
+    cfg.OversampleV = 1;
+    cfg.PixelSnapH = true;
+    const float px = 19.0f;
+    static const char* kFaces[] = {
+        // Debian / Ubuntu
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        // Fedora / RHEL
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto-sans-fonts/NotoSans-Regular.ttf",
+        // Arch / openSUSE
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    };
+    ImFont* loaded = nullptr;
+    for (const char* path : kFaces) {
+      if (!std::filesystem::exists(path)) continue;
+      loaded = io.Fonts->AddFontFromFileTTF(path, px, &cfg);
+      if (loaded) break;
+    }
+    if (!loaded) {
+      // Ask fontconfig, which knows about fonts in places no list can predict.
+      if (FILE* fp = popen("fc-match -f '%{file}' sans-serif 2>/dev/null", "r")) {
+        char buf[1024] = {0};
+        if (std::fgets(buf, sizeof(buf), fp)) {
+          std::string path(buf);
+          while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+          if (!path.empty() && std::filesystem::exists(path))
+            loaded = io.Fonts->AddFontFromFileTTF(path.c_str(), px, &cfg);
+        }
+        pclose(fp);
+      }
+    }
+    if (!loaded)
+      std::printf(
+          "no scalable UI font found - falling back to the built-in bitmap font.\n"
+          "  install one:  fonts-dejavu-core (Debian) / dejavu-sans-fonts (Fedora)\n");
   }
 
   // The shaper needs a live GL context, so it is initialised here.

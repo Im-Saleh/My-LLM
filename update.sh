@@ -96,6 +96,8 @@ fi
 # the desktop launcher, so this is a thin wrapper over it rather than a copy.
 ARGS=(--prefix "$PREFIX" --jobs "$JOBS")
 [[ ${#EXTRA[@]} -gt 0 ]] && ARGS+=("${EXTRA[@]}")
+# --with-olmo is only forwarded when asked for, and install.sh skips the download
+# when any GGUF is already present, so an update never re-downloads 4.5 GB.
 [[ $WITH_OLMO == 1 ]] && ARGS+=(--with-olmo)
 say "rebuilding and reinstalling"
 "$ROOT/install.sh" "${ARGS[@]}"
@@ -105,9 +107,13 @@ NEW_VERSION="$("$PREFIX/bin/slm" --version 2>/dev/null || echo unknown)"
 echo
 say "updated"
 printf '    %s\n    %s\n' "before: $OLD_VERSION" "after:  $NEW_VERSION"
-OLMO="$("$PREFIX/bin/slm" up --where 2>/dev/null | grep -c gguf || true)"
-if [[ "${OLMO:-0}" == "0" ]]; then
-  printf '    OLMo: not installed (%s)\n' "slm fetch-model olmo"
+# Report the ready-made model by asking the binary what it can see, so this
+# cannot disagree with what the program actually finds at run time.
+OLMO_SEEN="$("$PREFIX/bin/slm" --gguf-path 2>/dev/null || true)"
+if [[ -n "$OLMO_SEEN" ]]; then
+  printf '    OLMo:   %s (kept)\n' "$OLMO_SEEN"
+else
+  printf '    OLMo:   not installed (%s)\n' "slm fetch-model olmo"
 fi
 echo
 printf '  start it: \033[1;32m%s\033[0m\n' "slm"

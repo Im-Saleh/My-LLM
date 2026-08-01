@@ -150,8 +150,27 @@ if [[ $WITH_OLMO == 1 ]]; then
   OLMO_DIR="$MODELDIR"
   [[ -w "$OLMO_DIR" ]] || OLMO_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/slm/models"
   OLMO_FILE="$OLMO_DIR/allenai_Olmo-3-7B-Instruct-Q4_K_M.gguf"
-  if [[ -f "$OLMO_FILE" ]] && [[ "$(stat -c%s "$OLMO_FILE")" -gt 4000000000 ]]; then
-    say "OLMo already present: $OLMO_FILE"
+  # Look for an existing GGUF *everywhere* the program can find one, not just in
+  # the directory we would download into: a 4.5 GB re-download because the file
+  # sits one directory over is unacceptable.
+  EXISTING=""
+  for d in "$OLMO_DIR" "$MODELDIR" \
+           "${XDG_DATA_HOME:-$HOME/.local/share}/slm/models" \
+           "${XDG_DATA_HOME:-$HOME/.local/share}/slm" \
+           /usr/share/slm/models /usr/local/share/slm/models \
+           "$HOME/models" "$ROOT/models"; do
+    [[ -d "$d" ]] || continue
+    while IFS= read -r -d '' f; do
+      # Anything over 1 GB starting with the GGUF magic is a real model file.
+      if [[ "$(stat -c%s "$f")" -gt 1000000000 ]] && [[ "$(head -c4 "$f")" == "GGUF" ]]; then
+        EXISTING="$f"
+        break 2
+      fi
+    done < <(find "$d" -maxdepth 1 -name '*.gguf' -print0 2>/dev/null)
+  done
+  if [[ -n "$EXISTING" ]]; then
+    say "OLMo already present, not downloading again:"
+    printf '    %s (%s)\n' "$EXISTING" "$(du -h "$EXISTING" | cut -f1)"
   else
     say "downloading OLMo 3 7B Instruct Q4_K_M (4.5 GB) into $OLMO_DIR"
     # The download needs nothing from slm, so do it with curl directly: that way

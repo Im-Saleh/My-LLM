@@ -317,6 +317,14 @@ bool ModelBackendGGUF::load(std::string* err) {
   cp.n_batch = static_cast<uint32_t>(p_->opt.n_batch);
   cp.n_ubatch = static_cast<uint32_t>(std::min(p_->opt.n_batch, 512));
   cp.n_seq_max = static_cast<uint32_t>(std::max(1, p_->opt.n_seq_max));
+  // Without this, llama.cpp splits the KV cache into n_seq_max equal slices, so
+  // n_ctx=4096 with n_seq_max=4 gives every sequence only 1024 cells - while
+  // llama_n_ctx() still reports 4096.  Any prompt over 1024 tokens then dies
+  // with "llama_decode failed (1)", which is exactly what a retrieval-augmented
+  // question produces.  A unified pool lets one sequence use the whole context
+  // when it is the only one running, which is the common case, and still lets
+  // four debate voices share it when they are short.
+  cp.kv_unified = true;
   cp.n_threads = threads;
   cp.n_threads_batch = threads;
   cp.no_perf = true;
